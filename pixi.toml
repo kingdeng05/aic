@@ -34,6 +34,13 @@ ros-kilted-std-msgs = "*"                                                       
 ros-kilted-std-srvs = "*"
 ros-kilted-tf2-ros-py = "*"
 setuptools = ">=71.0.0,<81.0.0"                                                        # required by lerobot==0.4.3
+ros-kilted-my-policy-node = { path = "my_policy_node" }
+
+# Linux NVIDIA: torch +cu128 wheels (Blackwell/sm_120). macOS/arm64 has no cu128 builds — keep them
+# off the default index so osx-arm64 lock still resolves; lerobot pulls MPS/cpu torch on Mac.
+[target.linux-64.pypi-dependencies]
+torch = { version = "==2.7.1+cu128", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.22.1+cu128", index = "https://download.pytorch.org/whl/cu128" }
 
 [pypi-dependencies]
 huggingface-hub = { version = "==0.35.3", extras = ["hf-transfer", "cli"] }
@@ -43,6 +50,9 @@ lerobot_teleoperator_devices = { git = "https://github.com/koonpeng/lerobot-ros"
 mujoco = "==3.5.0"
 pynput = ">=1.7.6,<2"
 pyspacemouse = ">=2.0.0, <3"
+
+[tasks]
+aic-record = { cmd = "env LD_PRELOAD=$CONDA_PREFIX/lib/libjpeg.so.8 python aic_utils/lerobot_robot_aic/aic_record.py" }
 
 [activation]
 scripts = ["pixi_env_setup.sh"]

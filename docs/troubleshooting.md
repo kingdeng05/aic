@@ -72,14 +72,13 @@ If you want to use the NVIDIA GeForce RTX 5090 GPU with PyTorch, please check th
 The `lerobot` version in `pixi.toml` depends on an older version of `pytorch` (built for an older version of cuda). 
 `pixi install` will pull in that older version which does not support the newer sm_120 architecture for NVIDIA RTX 50xx cards.
 
-We were able to run this policy on an Nvidia RTX 5090 by adding the following to `pixi.toml`:
-```
-[pypi-options.dependency-overrides]
-torch = ">=2.7.1"
-torchvision = ">=0.22.1"
-```
+The workspace `pixi.toml` pins CUDA PyTorch **only on Linux** so `pixi lock` still works on **macOS/arm64** (there are no `+cu128` wheels for Apple Silicon):
 
-See this [LeRobot issue](https://github.com/huggingface/lerobot/issues/2217) for details.
+- **`[target.linux-64.pypi-dependencies]`** — `torch` and `torchvision` with `version = "==2.7.1+cu128"` / `==0.22.1+cu128` and **`index = "https://download.pytorch.org/whl/cu128"`** so other packages still resolve from PyPI (no global `extra-index-urls` / `unsafe-best-match` needed for that).
+
+After editing, run `pixi lock` and `pixi install` (use a longer timeout if downloads are slow, e.g. `UV_HTTP_TIMEOUT=300 pixi install`). On Linux you should see e.g. `torch 2.7.1+cu128`.
+
+See this [LeRobot issue](https://github.com/huggingface/lerobot/issues/2217) for related discussion.
 
 ## Error: no such container aic_eval
 

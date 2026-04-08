@@ -16,6 +16,7 @@ install(
 install(PROGRAMS
   scripts/test_impedance.py
   scripts/home_robot.py
+  scripts/episode_reset_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

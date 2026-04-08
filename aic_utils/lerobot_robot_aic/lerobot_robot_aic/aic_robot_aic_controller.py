@@ -47,6 +47,7 @@ from rclpy.publisher import Publisher
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.subscription import Subscription
 from sensor_msgs.msg import JointState
+from std_srvs.srv import Trigger
 
 from .aic_robot import aic_cameras, arm_joint_names
 from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
@@ -123,6 +124,7 @@ class AICRos2Interface:
     joint_motion_update_pub: Publisher[JointMotionUpdate]
     controller_state_sub: Subscription[ControllerState]
     joint_states_sub: Subscription[JointState]
+    episode_reset_client: Client[Trigger.Request, Trigger.Response]
     logger: RcutilsLogger
 
     @staticmethod
@@ -163,6 +165,8 @@ class AICRos2Interface:
             JointState, "/joint_states", joint_states_cb, qos_profile_sensor_data
         )
 
+        episode_reset_client = node.create_client(Trigger, "/episode_reset")
+
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         executor_thread = Thread(target=executor.spin, daemon=True)
@@ -178,6 +182,7 @@ class AICRos2Interface:
             joint_motion_update_pub=joint_motion_update_pub,
             controller_state_sub=controller_state_sub,
             joint_states_sub=joint_states_sub,
+            episode_reset_client=episode_reset_client,
             logger=logger,
         )
 
@@ -442,6 +447,25 @@ class AICRobotAICController(Robot):
             return action
         else:
             raise ValueError("Invalid teleop_target_mode")
+
+    def reset(self) -> None:
+        if not self.ros2_interface:
+            raise DeviceNotConnectedError()
+
+        if not self.ros2_interface.episode_reset_client.wait_for_service(timeout_sec=5.0):
+            logger.warning(
+                "Episode reset service not available. "
+                "Make sure episode_reset_node.py is running."
+            )
+            return
+
+        logger.info("Requesting episode reset...")
+        req = Trigger.Request()
+        response = self.ros2_interface.episode_reset_client.call(req)
+        if not response.success:
+            logger.error(f"Episode reset failed: {response.message}")
+        else:
+            logger.info("Episode reset complete")
 
     def disconnect(self) -> None:
         if not self.is_connected:

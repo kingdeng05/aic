@@ -69,6 +69,9 @@ rosdep install --from-paths src --ignore-src --rosdistro kilted -yr --skip-keys 
 # Install rmw_zenoh_cpp middleware and additional dependencies
 sudo apt install -y ros-kilted-rmw-zenoh-cpp python3-pynput
 
+# Python modules used by colcon / ament_cmake (system Python)
+sudo apt install -y python3-catkin-pkg-modules python3-toml
+
 # Build the workspace
 source /opt/ros/kilted/setup.bash
 GZ_BUILD_FROM_SOURCE=1 colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --merge-install --symlink-install --packages-ignore lerobot_robot_aic
@@ -90,6 +93,14 @@ source ~/.bashrc
 
 > [!NOTE]
 > This challenge uses [rmw_zenoh](https://github.com/ros2/rmw_zenoh) as the ROS 2 middleware. You must set the `RMW_IMPLEMENTATION` environment variable to `rmw_zenoh_cpp` in all terminals.
+
+### Build troubleshooting (Python)
+
+If `colcon build` fails with:
+
+- **`ModuleNotFoundError: No module named 'catkin_pkg'`** — CMake is running `ament_package` with a Python interpreter that does not have `catkin_pkg`. Install it for **that** interpreter. On Ubuntu, `python3-catkin-pkg-modules` (see above) covers `/usr/bin/python3`. If CMake uses **Conda** or another Python (check the path in the error), run e.g. `pip install catkin_pkg` in that environment.
+
+- **`ModuleNotFoundError: No module named 'toml'`** during package discovery — Install `python3-toml` (see above) or `pip install toml` for `/usr/bin/python3`.
 
 ---
 
