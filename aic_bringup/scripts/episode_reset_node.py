@@ -208,15 +208,9 @@ class EpisodeResetNode(Node):
             self._delete_entity(self.spawned_task_board_name)
             time.sleep(1.0)
 
-            # Step 2: Home robot (deactivate, reset joints, reactivate, hold position, tare)
-            # Done in a separate process to avoid Zenoh conflicts
-            randomize = self.get_parameter("randomize_start_pose").value
-            if randomize:
-                offset = self.get_parameter("random_offset_m").value
-                cmd = f"home_random {offset}"
-            else:
-                cmd = "home"
-            if not self._run_helper(cmd):
+            # Step 2: Home robot to nominal pose (no offset yet — cable needs
+            # the gripper at the fixed spawn location to attach properly).
+            if not self._run_helper("home"):
                 response.success = False
                 response.message = "Failed to home robot"
                 return response
@@ -229,12 +223,23 @@ class EpisodeResetNode(Node):
                 return response
             time.sleep(1.0)
 
-            # Step 4: Respawn cable
+            # Step 4: Respawn cable (attaches to gripper at nominal home)
             self.get_logger().info("Respawning cable...")
             if not self._spawn_cable():
                 response.success = False
                 response.message = "Failed to spawn cable"
                 return response
+
+            # Step 5: Apply random Cartesian offset AFTER cable is attached,
+            # so the gripper+cable move together to the randomized start pose.
+            randomize = self.get_parameter("randomize_start_pose").value
+            if randomize:
+                offset = self.get_parameter("random_offset_m").value
+                time.sleep(1.0)
+                if not self._run_helper(f"random_offset {offset}"):
+                    response.success = False
+                    response.message = "Failed to apply random offset"
+                    return response
 
             response.success = True
             response.message = "Episode reset complete"

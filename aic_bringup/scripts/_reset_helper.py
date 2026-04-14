@@ -64,7 +64,7 @@ def home():
     run_service_call(
         "/aic_controller/change_target_mode",
         "aic_control_interfaces/srv/ChangeTargetMode",
-        "{target_mode: {mode: 1}}",  # MODE_JOINT = 1
+        "{target_mode: {mode: 2}}",  # MODE_JOINT = 2
     )
     time.sleep(0.3)
 
@@ -74,7 +74,7 @@ def home():
         'velocities: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}, '
         'target_stiffness: [85.0, 85.0, 85.0, 85.0, 85.0, 85.0], '
         'target_damping: [75.0, 75.0, 75.0, 75.0, 75.0, 75.0], '
-        'trajectory_generation_mode: {mode: 1}}'  # MODE_POSITION = 1
+        'trajectory_generation_mode: {mode: 2}}'  # MODE_POSITION = 2
     )
     # Publish repeatedly for 5 seconds so the controller continuously tracks home
     print("Publishing home joint commands for 5 seconds...")
@@ -95,7 +95,7 @@ def home():
     run_service_call(
         "/aic_controller/change_target_mode",
         "aic_control_interfaces/srv/ChangeTargetMode",
-        "{target_mode: {mode: 0}}",  # MODE_CARTESIAN = 0
+        "{target_mode: {mode: 1}}",  # MODE_CARTESIAN = 1
     )
 
     print("Taring FT sensor...")
@@ -142,10 +142,10 @@ def apply_random_cartesian_offset(max_offset_m: float = DEFAULT_RANDOM_OFFSET_M)
         f'target_damping: {diag36(75.0)}, '
         'feedforward_wrench_at_tip: {force: {x: 0.0, y: 0.0, z: 0.0}, torque: {x: 0.0, y: 0.0, z: 0.0}}, '
         'wrench_feedback_gains_at_tip: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], '
-        'trajectory_generation_mode: {mode: 1}}'  # MODE_POSITION = 1
+        'trajectory_generation_mode: {mode: 2}}'  # MODE_POSITION = 2
     )
 
-    print("Publishing Cartesian pose target for 3 seconds to let robot settle...")
+    print("Publishing Cartesian pose target for 8 seconds to let robot settle...")
     pub_proc = subprocess.Popen(
         ["ros2", "topic", "pub", "--rate", "50",
          "/aic_controller/pose_commands",
@@ -153,7 +153,7 @@ def apply_random_cartesian_offset(max_offset_m: float = DEFAULT_RANDOM_OFFSET_M)
          pose_cmd],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    time.sleep(3.0)
+    time.sleep(8.0)
     pub_proc.terminate()
     pub_proc.wait()
 
@@ -178,6 +178,12 @@ if __name__ == "__main__":
         if len(sys.argv) > 2:
             max_off = float(sys.argv[2])
         ok = home() and apply_random_cartesian_offset(max_off)
+        sys.exit(0 if ok else 1)
+    elif cmd == "random_offset":
+        max_off = DEFAULT_RANDOM_OFFSET_M
+        if len(sys.argv) > 2:
+            max_off = float(sys.argv[2])
+        ok = apply_random_cartesian_offset(max_off)
         sys.exit(0 if ok else 1)
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
