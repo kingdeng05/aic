@@ -73,6 +73,10 @@ class EpisodeResetNode(Node):
         self.declare_parameter("nic_card_mount_0_present", True)
         self.declare_parameter("nic_card_mount_0_translation", 0.0)
         self.declare_parameter("nic_card_mount_0_yaw", 0.0)
+        # If True, apply a random Cartesian translation offset after homing.
+        self.declare_parameter("randomize_start_pose", False)
+        # Max absolute offset per axis in meters (uniform [-x, +x] in x/y/z).
+        self.declare_parameter("random_offset_m", 0.06)
         for key, val in DEFAULT_TASK_BOARD_POSE.items():
             self.declare_parameter(f"task_board_{key}", val)
         for key, val in DEFAULT_CABLE_POSE.items():
@@ -104,14 +108,17 @@ class EpisodeResetNode(Node):
         return future.result()
 
     def _run_helper(self, command, timeout=60):
-        """Run helper script in a separate process to avoid Zenoh session conflicts."""
+        """Run helper script in a separate process to avoid Zenoh session conflicts.
+
+        `command` may include args separated by spaces, e.g. "home_random 0.03".
+        """
         self.get_logger().info(f"Running helper: {command}...")
         env = os.environ.copy()
         env["ZENOH_CONFIG_OVERRIDE"] = "transport/shared_memory/enabled=false"
         env["RMW_IMPLEMENTATION"] = "rmw_zenoh_cpp"
         try:
             result = subprocess.run(
-                ["/usr/bin/python3", HELPER_SCRIPT, command],
+                ["/usr/bin/python3", HELPER_SCRIPT, *command.split()],
                 capture_output=True, text=True, timeout=timeout, env=env
             )
             self.get_logger().info(f"Helper stdout: {result.stdout.strip()}")
@@ -201,8 +208,8 @@ class EpisodeResetNode(Node):
             self._delete_entity(self.spawned_task_board_name)
             time.sleep(1.0)
 
-            # Step 2: Home robot (deactivate, reset joints, reactivate, hold position, tare)
-            # Done in a separate process to avoid Zenoh conflicts
+            # Step 2: Home robot to nominal pose (no offset yet — cable needs
+            # the gripper at the fixed spawn location to attach properly).
             if not self._run_helper("home"):
                 response.success = False
                 response.message = "Failed to home robot"
@@ -216,12 +223,23 @@ class EpisodeResetNode(Node):
                 return response
             time.sleep(1.0)
 
-            # Step 4: Respawn cable
+            # Step 4: Respawn cable (attaches to gripper at nominal home)
             self.get_logger().info("Respawning cable...")
             if not self._spawn_cable():
                 response.success = False
                 response.message = "Failed to spawn cable"
                 return response
+
+            # Step 5: Apply random Cartesian offset AFTER cable is attached,
+            # so the gripper+cable move together to the randomized start pose.
+            randomize = self.get_parameter("randomize_start_pose").value
+            if randomize:
+                offset = self.get_parameter("random_offset_m").value
+                time.sleep(1.0)
+                if not self._run_helper(f"random_offset {offset}"):
+                    response.success = False
+                    response.message = "Failed to apply random offset"
+                    return response
 
             response.success = True
             response.message = "Episode reset complete"
