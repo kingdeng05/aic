@@ -16,6 +16,9 @@
 
 
 import numpy as np
+import os
+import yaml
+from datetime import datetime
 
 from aic_model.policy import (
     GetObservationCallback,
@@ -35,12 +38,66 @@ QuaternionTuple = tuple[float, float, float, float]
 
 
 class CheatCode(Policy):
-    def __init__(self, parent_node):
+    EPISODE_SAVE_DIR = os.environ.get(
+        "AIC_EPISODE_SAVE_DIR",
+        "/home/sai/ws_aic_challenge/src/aic/aic_utils/lerobot_robot_aic/lerobot_data_aic",
+    )
+
+    def __init__(self, parent_node, record=True):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
         self._max_integrator_windup = 0.05
         self._task = None
         super().__init__(parent_node)
+        
+        self._record = record
+        self._recorded_steps: list[dict] = []
+        self.get_logger().info(f"Recording enabled: {self._record}")
+        self.get_logger().info(f"Episode save directory: {self.EPISODE_SAVE_DIR}")
+
+    def _snapshot_tf(self, phase: str, z_offset: float, elapsed: float) -> None:
+        try:
+            frames = {
+                "gripper_tcp": "gripper/tcp",
+                "plug_tip": f"{self._task.cable_name}/{self._task.plug_name}_link",
+                "port": f"task_board/{self._task.target_module_name}/{self._task.port_name}_link",
+            }
+            step: dict = {"t": round(elapsed, 4), "phase": phase, "z_offset": round(z_offset, 5)}
+            for key, frame in frames.items():
+                tf = self._parent_node._tf_buffer.lookup_transform("base_link", frame, Time())
+                tr = tf.transform.translation
+                ro = tf.transform.rotation
+                step[key] = {
+                    "x": float(tr.x), "y": float(tr.y), "z": float(tr.z),
+                    "qw": float(ro.w), "qx": float(ro.x), "qy": float(ro.y), "qz": float(ro.z),
+                }
+            self._recorded_steps.append(step)
+        except TransformException as ex:
+            self.get_logger().warn(f"Snapshot TF lookup failed: {ex}")
+
+    def _save_episode(self) -> None:
+        self.get_logger().info(f"Attempting to save episode with {len(self._recorded_steps)} steps")
+        if not self._recorded_steps:
+            self.get_logger().warn("No recorded steps to save")
+            return
+        os.makedirs(self.EPISODE_SAVE_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        episode = {
+            "episode": {
+                "task": {
+                    "cable_name": self._task.cable_name,
+                    "plug_name": self._task.plug_name,
+                    "target_module_name": self._task.target_module_name,
+                    "port_name": self._task.port_name,
+                },
+                "timestamp": timestamp,
+                "steps": self._recorded_steps,
+            }
+        }
+        path = os.path.join(self.EPISODE_SAVE_DIR, f"episode_{timestamp}.yaml")
+        with open(path, "w") as f:
+            yaml.dump(episode, f, default_flow_style=False)
+        self.get_logger().info(f"Episode saved to {path} ({len(self._recorded_steps)} steps)")
 
     def _wait_for_tf(
         self, target_frame: str, source_frame: str, timeout_sec: float = 10.0
@@ -193,6 +250,8 @@ class CheatCode(Policy):
     ):
         self.get_logger().info(f"CheatCode.insert_cable() task: {task}")
         self._task = task
+        self._recorded_steps = []
+        elapsed = 0.0
 
         port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
         cable_tip_frame = f"{task.cable_name}/{task.plug_name}_link"
@@ -233,7 +292,10 @@ class CheatCode(Policy):
                 )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during interpolation: {ex}")
+            if self._record:
+                self._snapshot_tf("approach", z_offset, elapsed)
             self.sleep_for(0.05)
+            elapsed += 0.05
 
         # Descend until the cable is inserted into the port.
         while True:
@@ -249,10 +311,16 @@ class CheatCode(Policy):
                 )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insertion: {ex}")
+            if self._record:
+                self._snapshot_tf("insert", z_offset, elapsed)
             self.sleep_for(0.05)
+            elapsed += 0.05
 
         self.get_logger().info("Waiting for connector to stabilize...")
         self.sleep_for(5.0)
+
+        if self._record:
+            self._save_episode()
 
         self.get_logger().info("CheatCode.insert_cable() exiting...")
         return True
