@@ -79,7 +79,7 @@ pynput = ">=1.7.6,<2"
 pyspacemouse = ">=2.0.0, <3"
 
 [tasks]
-aic-record = { cmd = "env LD_PRELOAD=$CONDA_PREFIX/lib/libjpeg.so.8 python aic_utils/lerobot_robot_aic/aic_record.py" }
+aic-record = { cmd = "env LD_PRELOAD=$CONDA_PREFIX/lib/libjpeg.so.8:$CONDA_PREFIX/lib/libpng16.so.16 python aic_utils/lerobot_robot_aic/aic_record.py" }
 
 [activation]
 scripts = ["pixi_env_setup.sh"]
