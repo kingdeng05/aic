@@ -152,6 +152,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     if hasattr(robot, "reset"):
                         robot.reset()
 
+                    # Clear per-episode teleop state (OU bias, phase,
+                    # integrator, cached last action) so episode 2+
+                    # doesn't inherit the prior episode's HOLD pose.
+                    if teleop is not None and hasattr(teleop, "reset"):
+                        teleop.reset()
+
                     record_loop(
                         robot=robot,
                         events=events,
@@ -164,6 +170,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
+
+                    # Reset teleop AGAIN after the reset window: the
+                    # reset record_loop above polls get_action() and
+                    # consumes fresh APPROACH ticks, so by now phase
+                    # would be mid-approach (or DESCEND) with stale
+                    # OU bias. Re-reset so the next real episode starts
+                    # clean from the randomized home pose.
+                    if teleop is not None and hasattr(teleop, "reset"):
+                        teleop.reset()
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)

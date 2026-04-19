@@ -73,6 +73,11 @@ class CheatCodeTeleopConfig(TeleoperatorConfig):
     integrator_max_windup: float = 0.05
     integrator_i_gain: float = 0.15
 
+    # Per-tick slew limit on commanded pose (defense against episode-
+    # boundary discontinuities or TF hiccups). Disable by setting <=0.
+    max_step_xyz_m: float = 0.02
+    max_step_rot_deg: float = 5.0
+
 
 class CheatCodeTeleop(Teleoperator):
     def __init__(self, config: CheatCodeTeleopConfig):
@@ -205,6 +210,55 @@ class CheatCodeTeleop(Teleoperator):
         self._perturbation.reset()
         self._last_action = None
 
+    def reset(self) -> None:
+        """Called by the record wrapper between episodes to clear OU bias,
+        phase/tick/integrator state, and the cached last action. Also
+        re-snapshots the port TF so port-pose randomization (if any) is
+        picked up fresh.
+        """
+        if not self._is_connected or self._tf_buffer is None:
+            return
+        try:
+            port_frame = (
+                f"task_board/{self.config.target_module_name}/{self.config.port_name}_link"
+            )
+            port_tf = self._tf_buffer.lookup_transform("base_link", port_frame, Time())
+            self._port_transform = port_tf.transform
+        except TransformException as ex:
+            if self._node is not None:
+                self._node.get_logger().warn(
+                    f"CheatCodeTeleop.reset(): port TF refresh failed: {ex}"
+                )
+        self._reset_episode_state()
+
+    def _apply_slew_limit(self, action: PoseTargetActionDict) -> PoseTargetActionDict:
+        if self._last_action is None:
+            return action
+        max_xyz = self.config.max_step_xyz_m
+        if max_xyz <= 0.0:
+            return action
+        dx = action["position.x"] - self._last_action["position.x"]
+        dy = action["position.y"] - self._last_action["position.y"]
+        dz = action["position.z"] - self._last_action["position.z"]
+        step = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if step > max_xyz:
+            k = max_xyz / step
+            action = cast(
+                PoseTargetActionDict,
+                {
+                    **action,
+                    "position.x": self._last_action["position.x"] + dx * k,
+                    "position.y": self._last_action["position.y"] + dy * k,
+                    "position.z": self._last_action["position.z"] + dz * k,
+                },
+            )
+            if self._node is not None:
+                self._node.get_logger().warn(
+                    f"CheatCodeTeleop: clamped commanded pose step {step * 100:.2f}cm → "
+                    f"{max_xyz * 100:.2f}cm (tick={self._tick}, phase={self._phase})"
+                )
+        return action
+
     def _advance_schedule(self) -> tuple[float, float, float, bool]:
         """Return (slerp_fraction, position_fraction, z_offset, reset_integrator)
         for the current tick, and advance state.
@@ -327,6 +381,7 @@ class CheatCodeTeleop(Teleoperator):
             "orientation.y": float(qy),
             "orientation.z": float(qz),
         }
+        action = self._apply_slew_limit(action)
         self._last_action = action
         self._tick += 1
         return cast(dict, action)
