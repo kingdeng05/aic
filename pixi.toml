@@ -11,6 +11,7 @@ preview = ["pixi-build"]
 evdev = ">=1.9.2,<2"
 
 [dependencies]
+colcon-common-extensions = ">=0.3.0,<0.4"
 isort = "==5.13.2"                                                                     # version bundled by the vscode extension
 json5 = ">=0.13.0,<0.14"                                                               # version bundled by the vscode extension
 numpy = "<2.3.0"
@@ -23,18 +24,44 @@ ros-kilted-aic-model-interfaces = { path = "aic_interfaces/aic_model_interfaces"
 ros-kilted-aic-task-interfaces = { path = "aic_interfaces/aic_task_interfaces" }
 ros-kilted-aic-teleoperation = { path = "aic_utils/aic_teleoperation" }
 ros-kilted-control-msgs = "*"                                                          # lerobot_robot_ros
+ros-kilted-controller-interface = "*"                                                  # aic_controller
+ros-kilted-controller-manager-msgs = "*"                                               # aic_engine
+ros-kilted-generate-parameter-library = "*"                                            # aic_controller
 ros-kilted-geometry-msgs = "*"                                                         # lerobot_robot_ros
+ros-kilted-gz-cmake-vendor = "*"                                                       # aic_gazebo
+ros-kilted-gz-common-vendor = "*"                                                      # aic_gazebo
+ros-kilted-gz-math-vendor = "*"                                                        # aic_scoring
+ros-kilted-gz-msgs-vendor = "*"                                                        # aic_gazebo
+ros-kilted-gz-plugin-vendor = "*"                                                      # aic_gazebo
+ros-kilted-gz-sim-vendor = "*"                                                         # aic_gazebo
+ros-kilted-hardware-interface = "*"                                                    # aic_controller
+ros-kilted-joint-limits = "*"                                                          # aic_controller
+ros-kilted-kdl-parser = "*"                                                            # aic_controller
+ros-kilted-kinematics-interface = "*"                                                  # aic_controller
 ros-kilted-lerobot-robot-aic = { path = "aic_utils/lerobot_robot_aic" }
 ros-kilted-moveit-msgs = "*"                                                           # lerobot_robot_ros
+ros-kilted-rclcpp-components = "*"                                                     # aic_scoring
 ros-kilted-rclpy = "*"
+ros-kilted-realtime-tools = "*"                                                        # aic_controller
 ros-kilted-rmw-zenoh-cpp = "*"
+ros-kilted-rosbag2-cpp = "*"                                                           # aic_scoring
 ros-kilted-ros-core = "*"
+ros-kilted-ros-gz-interfaces = "*"                                                     # aic_scoring
 ros-kilted-sensor-msgs = "*"                                                           # lerobot_robot_ros
+ros-kilted-simulation-interfaces = "*"                                                 # aic_engine
 ros-kilted-std-msgs = "*"                                                              # lerobot_robot_ros
 ros-kilted-std-srvs = "*"
+ros-kilted-tf2-eigen = "*"                                                             # aic_controller
+ros-kilted-tf2-geometry-msgs = "*"                                                     # aic_scoring
 ros-kilted-tf2-ros-py = "*"
+ros-kilted-yaml-cpp-vendor = "*"                                                       # aic_engine
+protobuf = "*"                                                                         # aic_gazebo
+sophus = "*"                                                                           # aic_controller
 setuptools = ">=71.0.0,<81.0.0"                                                        # required by lerobot==0.4.3
 ros-kilted-my-policy-node = { path = "my_policy_node" }
+pip = ">=26.0.1,<27"
+gxx_linux-64 = ">=15.2.0,<16"
+gcc_linux-64 = ">=15.2.0,<16"
 
 # Linux NVIDIA: torch +cu128 wheels (Blackwell/sm_120). macOS/arm64 has no cu128 builds — keep them
 # off the default index so osx-arm64 lock still resolves; lerobot pulls MPS/cpu torch on Mac.
@@ -52,7 +79,7 @@ pynput = ">=1.7.6,<2"
 pyspacemouse = ">=2.0.0, <3"
 
 [tasks]
-aic-record = { cmd = "env LD_PRELOAD=$CONDA_PREFIX/lib/libjpeg.so.8 python aic_utils/lerobot_robot_aic/aic_record.py" }
+aic-record = { cmd = "env LD_PRELOAD=$CONDA_PREFIX/lib/libjpeg.so.8:$CONDA_PREFIX/lib/libpng16.so.16 python aic_utils/lerobot_robot_aic/aic_record.py" }
 
 [activation]
 scripts = ["pixi_env_setup.sh"]

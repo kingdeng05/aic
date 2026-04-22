@@ -34,7 +34,7 @@ from aic_control_interfaces.msg import (
     TrajectoryGenerationMode,
 )
 from aic_control_interfaces.srv import ChangeTargetMode
-from geometry_msgs.msg import Twist, Vector3, Wrench
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, Wrench
 from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots import Robot, RobotConfig
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -50,7 +50,11 @@ from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 
 from .aic_robot import aic_cameras, arm_joint_names
-from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
+from .types import (
+    JointMotionUpdateActionDict,
+    MotionUpdateActionDict,
+    PoseTargetActionDict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,10 +211,10 @@ class AICRobotAICController(Robot):
             )
         self.frame_id = config.teleop_frame_id
 
-        if config.teleop_target_mode not in ["cartesian", "joint"]:
+        if config.teleop_target_mode not in ["cartesian", "joint", "pose"]:
             raise ValueError(
                 f"Invalid teleop_target_mode: '{config.teleop_target_mode}'. "
-                "Supported modes are 'cartesian' or 'joint'."
+                "Supported modes are 'cartesian', 'joint', or 'pose'."
             )
         self.teleop_target_mode = config.teleop_target_mode
 
@@ -263,11 +267,11 @@ class AICRobotAICController(Robot):
 
     @cached_property
     def action_features(self) -> dict[str, type]:
-        return (
-            MotionUpdateActionDict.__annotations__
-            if self.teleop_target_mode == "cartesian"
-            else JointMotionUpdateActionDict.__annotations__
-        )
+        if self.teleop_target_mode == "cartesian":
+            return MotionUpdateActionDict.__annotations__
+        if self.teleop_target_mode == "pose":
+            return PoseTargetActionDict.__annotations__
+        return JointMotionUpdateActionDict.__annotations__
 
     @property
     def is_connected(self) -> bool:
@@ -292,6 +296,8 @@ class AICRobotAICController(Robot):
             controller_state_cb, joint_states_cb
         )
 
+        # "pose" uses the Cartesian admittance controller with MODE_POSITION
+        # trajectory generation; the controller target_mode is still Cartesian.
         change_mode_req = (
             TargetMode.MODE_JOINT
             if self.teleop_target_mode == "joint"
@@ -438,9 +444,54 @@ class AICRobotAICController(Robot):
 
         self.ros2_interface.joint_motion_update_pub.publish(msg)
 
+    def send_action_pose(self, action: dict[str, Any]) -> None:
+        if not self._is_connected or not self.ros2_interface:
+            raise DeviceNotConnectedError()
+
+        pose_action = cast(PoseTargetActionDict, action)
+
+        try:
+            pose_msg = Pose(
+                position=Point(
+                    x=float(pose_action["position.x"]),
+                    y=float(pose_action["position.y"]),
+                    z=float(pose_action["position.z"]),
+                ),
+                orientation=Quaternion(
+                    w=float(pose_action["orientation.w"]),
+                    x=float(pose_action["orientation.x"]),
+                    y=float(pose_action["orientation.y"]),
+                    z=float(pose_action["orientation.z"]),
+                ),
+            )
+        except KeyError as ex:
+            raise KeyError(
+                f"Missing pose-target action key {ex}. "
+                "If using `--teleop.type=cheatcode`, have you set "
+                "`--robot.teleop_target_mode=pose`?"
+            ) from None
+
+        msg = MotionUpdate()
+        msg.header.stamp = self.ros2_interface.node.get_clock().now().to_msg()
+        # Pose targets are expressed in base_link (world frame for this robot).
+        msg.header.frame_id = "base_link"
+        msg.pose = pose_msg
+        msg.target_stiffness = np.diag([90.0, 90.0, 90.0, 50.0, 50.0, 50.0]).flatten()
+        msg.target_damping = np.diag([50.0, 50.0, 50.0, 20.0, 20.0, 20.0]).flatten()
+        msg.feedforward_wrench_at_tip = Wrench(
+            force=Vector3(x=0.0, y=0.0, z=0.0),
+            torque=Vector3(x=0.0, y=0.0, z=0.0),
+        )
+        msg.wrench_feedback_gains_at_tip = [0.5, 0.5, 0.5, 0.0, 0.0, 0.0]
+        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_POSITION
+        self.ros2_interface.motion_update_pub.publish(msg)
+
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if self.teleop_target_mode == "cartesian":
             self.send_action_cartesian(action)
+            return action
+        elif self.teleop_target_mode == "pose":
+            self.send_action_pose(action)
             return action
         elif self.teleop_target_mode == "joint":
             self.send_action_joint(action)
