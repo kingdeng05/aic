@@ -56,7 +56,7 @@ class RunACT(Policy):
         # -------------------------------------------------------------------------
         policy_path = Path(os.environ.get(
             "AIC_ACT_MODEL_PATH",
-            "/home/fuheng/ws_aic/src/aic/outputs/train/act_joints_v1/checkpoints/020000/pretrained_model",
+            "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
         ))
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)

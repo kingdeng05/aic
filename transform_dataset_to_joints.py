@@ -1,118 +1,135 @@
 """
-Transform LeRobot dataset: replace velocity-twist action with next-frame joint positions.
+Transform LeRobot dataset: replace the recorded action with next-frame joint positions.
 
-This converts the action representation from 6-dim bang-bang velocity commands
-(which don't work well with ACT) to 7-dim absolute joint position targets
-(which match what the original ACT paper uses).
+Many teleop datasets record action as either a 6-dim velocity twist or a 7-dim
+absolute TCP pose. Neither target works well with ACT out of the box. This
+script rewrites the `action` column as 7-dim absolute joint positions, pulled
+from `observation.state[19:26]` at the next frame (`action[t] = joints[t+1]`).
+For the final frame of each episode, action = current joints (hold pose).
 
-For each frame t, the new action = observation.state[t+1][19:26] (next frame joint positions).
-For the last frame of each episode, action = current frame joint positions (hold pose).
+Usage:
+    python transform_dataset_to_joints.py \\
+        --src <user>/<source-repo-id> \\
+        --dst <user>/<dest-repo-id>
+
+Paths resolve under ~/.cache/huggingface/lerobot/<user>/<repo_id> by default.
+Pass --prefix to override.
 """
 
+import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
-import glob
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
-SRC = Path("/home/fuheng/.cache/huggingface/lerobot/kingdeng05/aic-insert-demo-2")
-DST = Path("/home/fuheng/.cache/huggingface/lerobot/kingdeng05/aic-insert-demo-2-joints")
+DEFAULT_PREFIX = Path.home() / ".cache" / "huggingface" / "lerobot"
+JOINT_SLICE = slice(19, 26)  # 7 joint positions inside observation.state
 
-# Clean and create destination
-if DST.exists():
-    shutil.rmtree(DST)
-DST.mkdir(parents=True)
 
-# Copy everything first, then overwrite the parts we need
-print(f"Copying {SRC} -> {DST}")
-shutil.copytree(SRC, DST, dirs_exist_ok=True)
+def resolve(repo_id: str, prefix: Path) -> Path:
+    if "/" not in repo_id:
+        sys.exit(f"error: expected '<user>/<repo-id>', got '{repo_id}'")
+    return prefix / repo_id
 
-# Transform parquet files
-data_dir = DST / "data" / "chunk-000"
-parquet_files = sorted(glob.glob(str(data_dir / "*.parquet")))
-print(f"Transforming {len(parquet_files)} parquet files")
 
-JOINT_SLICE = slice(19, 26)  # 7 joint positions in observation.state
+def transform(src: Path, dst: Path) -> None:
+    if not (src / "meta" / "info.json").exists():
+        sys.exit(f"error: {src} is not a LeRobot dataset (missing meta/info.json)")
 
-for pf in parquet_files:
-    df = pd.read_parquet(pf)
+    if dst.exists():
+        print(f"Removing existing {dst}")
+        shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
 
-    # Sort by episode then frame to ensure correct ordering for next-frame lookup
-    df = df.sort_values(["episode_index", "frame_index"]).reset_index(drop=True)
+    print(f"Copying {src} -> {dst}")
+    shutil.copytree(src, dst)
 
-    states = np.stack(df["observation.state"].values)
-    joint_positions = states[:, JOINT_SLICE].astype(np.float32)  # (N, 7)
+    data_dir = dst / "data" / "chunk-000"
+    parquet_files = sorted(data_dir.glob("*.parquet"))
+    print(f"Transforming {len(parquet_files)} parquet files")
 
-    # For each frame, action = next frame's joint positions (same episode)
-    new_actions = np.zeros((len(df), 7), dtype=np.float32)
-    for ep in df["episode_index"].unique():
-        mask = (df["episode_index"] == ep).values
-        idxs = np.where(mask)[0]
-        ep_joints = joint_positions[idxs]
-        # Shift by +1: action[t] = joints[t+1]
-        ep_new = np.empty_like(ep_joints)
-        ep_new[:-1] = ep_joints[1:]
-        ep_new[-1] = ep_joints[-1]  # last frame: hold
-        new_actions[idxs] = ep_new
+    for pf in parquet_files:
+        df = pd.read_parquet(pf)
+        df = df.sort_values(["episode_index", "frame_index"]).reset_index(drop=True)
 
-    # Replace action column (must store as list-of-arrays for parquet compatibility)
-    df["action"] = [row for row in new_actions]
+        states = np.stack(df["observation.state"].values)
+        state_dim = states.shape[1]
+        if state_dim < JOINT_SLICE.stop:
+            sys.exit(
+                f"error: observation.state has {state_dim} dims, "
+                f"needs >= {JOINT_SLICE.stop} to slice joints 19:26"
+            )
+        joint_positions = states[:, JOINT_SLICE].astype(np.float32)  # (N, 7)
 
-    df.to_parquet(pf, index=False)
-    print(f"  {Path(pf).name}: {len(df)} rows transformed")
+        new_actions = np.zeros((len(df), 7), dtype=np.float32)
+        for ep in df["episode_index"].unique():
+            idxs = np.where((df["episode_index"] == ep).values)[0]
+            ep_joints = joint_positions[idxs]
+            ep_new = np.empty_like(ep_joints)
+            ep_new[:-1] = ep_joints[1:]
+            ep_new[-1] = ep_joints[-1]
+            new_actions[idxs] = ep_new
 
-# Update info.json
-info_path = DST / "meta" / "info.json"
-with open(info_path) as f:
-    info = json.load(f)
+        df["action"] = [row for row in new_actions]
+        df.to_parquet(pf, index=False)
+        print(f"  {pf.name}: {len(df)} rows transformed")
 
-info["features"]["action"] = {
-    "dtype": "float32",
-    "names": [
-        "joint_positions.0",
-        "joint_positions.1",
-        "joint_positions.2",
-        "joint_positions.3",
-        "joint_positions.4",
-        "joint_positions.5",
-        "joint_positions.6",
-    ],
-    "shape": [7],
-}
+    info_path = dst / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["action"] = {
+        "dtype": "float32",
+        "names": [f"joint_positions.{i}" for i in range(7)],
+        "shape": [7],
+    }
+    info_path.write_text(json.dumps(info, indent=4))
+    print("Updated info.json: action now 7-dim joint positions")
 
-with open(info_path, "w") as f:
-    json.dump(info, f, indent=4)
-print(f"Updated info.json: action shape 6 -> 7")
+    print("Recomputing action stats...")
+    all_actions = []
+    for pf in parquet_files:
+        df = pd.read_parquet(pf)
+        all_actions.append(np.stack(df["action"].values))
+    all_actions = np.concatenate(all_actions)
 
-# Recompute stats.json for the action feature
-print("Recomputing action stats...")
-all_actions = []
-for pf in parquet_files:
-    df = pd.read_parquet(pf)
-    all_actions.append(np.stack(df["action"].values))
-all_actions = np.concatenate(all_actions)  # (N, 7)
+    stats_path = dst / "meta" / "stats.json"
+    if stats_path.exists():
+        stats = json.loads(stats_path.read_text())
+    else:
+        stats = {}
 
-stats_path = DST / "meta" / "stats.json"
-with open(stats_path) as f:
-    stats = json.load(f)
+    std = all_actions.std(axis=0)
+    stats["action"] = {
+        "mean": all_actions.mean(axis=0).tolist(),
+        "std": std.tolist() if std.min() > 0 else (std + 1e-6).tolist(),
+        "min": all_actions.min(axis=0).tolist(),
+        "max": all_actions.max(axis=0).tolist(),
+        "count": [len(all_actions)],
+    }
+    stats_path.write_text(json.dumps(stats, indent=4))
+    print(f"  action mean: {stats['action']['mean']}")
+    print(f"  action std : {stats['action']['std']}")
+    print(f"  action min : {stats['action']['min']}")
+    print(f"  action max : {stats['action']['max']}")
 
-stats["action"] = {
-    "mean": all_actions.mean(axis=0).tolist(),
-    "std": all_actions.std(axis=0).tolist() if all_actions.std(axis=0).min() > 0 else (all_actions.std(axis=0) + 1e-6).tolist(),
-    "min": all_actions.min(axis=0).tolist(),
-    "max": all_actions.max(axis=0).tolist(),
-    "count": [len(all_actions)],
-}
+    print(f"\nDone. New dataset at: {dst}")
 
-with open(stats_path, "w") as f:
-    json.dump(stats, f, indent=4)
-print(f"Updated stats.json with new action stats")
-print(f"  action mean: {stats['action']['mean']}")
-print(f"  action std:  {stats['action']['std']}")
-print(f"  action min:  {stats['action']['min']}")
-print(f"  action max:  {stats['action']['max']}")
 
-print(f"\nDone! New dataset at: {DST}")
-print(f"To train: --dataset.repo_id=kingdeng05/aic-insert-demo-2-joints")
-print(f"(LeRobot will load from local cache first)")
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--src", required=True, help="source repo_id, e.g. sai-chand-gubbala/cheatcode-teleop-sfpsc-nic-30")
+    p.add_argument("--dst", required=True, help="destination repo_id, e.g. kingdeng05/cheatcode-teleop-sfpsc-nic-30-joints")
+    p.add_argument("--prefix", type=Path, default=DEFAULT_PREFIX,
+                   help=f"cache prefix (default: {DEFAULT_PREFIX})")
+    args = p.parse_args()
+
+    src = resolve(args.src, args.prefix)
+    dst = resolve(args.dst, args.prefix)
+    transform(src, dst)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
