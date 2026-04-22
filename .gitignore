@@ -11,13 +11,8 @@ log/
 CMakeFiles/
 
 # pixi environments
-.pixi/
+.pixi/*
 !.pixi/config.toml
-pixi.toml
-pixi.lock
-.pixi-*
-*.pixi
-pixi-*.log
 
 # Ignore mesh/texture assets in aic_mujoco mjcf, keep only .xml
 aic_utils/aic_mujoco/mjcf/*.obj
