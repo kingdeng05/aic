@@ -10,6 +10,7 @@ import subprocess
 import time
 import math
 import json
+import random
 import sys
 
 os.environ["ZENOH_CONFIG_OVERRIDE"] = "transport/shared_memory/enabled=false"
@@ -44,6 +45,13 @@ DEFAULT_CABLE_POSE = {
     "roll": 0.4432, "pitch": -0.48, "yaw": 1.3303,
 }
 
+NIC_MOUNT_RAILS = [f"nic_card_mount_{i}" for i in range(5)]
+SC_PORT_MOUNT_RAILS = [f"sc_port_{i}" for i in range(2)]
+LC_MOUNTS = [f"lc_mount_rail_{i}" for i in range(2)]
+SFP_MOUNTS = [f"sfp_mount_rail_{i}" for i in range(2)]
+SC_MOUNTS = [f"sc_mount_rail_{i}" for i in range(2)]
+PICK_MOUNTS = LC_MOUNTS + SFP_MOUNTS + SC_MOUNTS
+
 # Path to the helper script that runs ros2 service calls in a clean process
 # Use the source path directly since the installed path follows symlinks
 HELPER_SCRIPT = os.path.join(
@@ -70,9 +78,6 @@ class EpisodeResetNode(Node):
 
         self.declare_parameter("cable_type", "sfp_sc_cable")
         self.declare_parameter("attach_cable_to_gripper", True)
-        self.declare_parameter("nic_card_mount_0_present", True)
-        self.declare_parameter("nic_card_mount_0_translation", 0.0)
-        self.declare_parameter("nic_card_mount_0_yaw", 0.0)
         # If True, apply a random Cartesian translation offset after homing.
         self.declare_parameter("randomize_start_pose", False)
         # Max absolute offset per axis in meters (uniform [-x, +x] in x/y/z).
@@ -81,6 +86,34 @@ class EpisodeResetNode(Node):
             self.declare_parameter(f"task_board_{key}", val)
         for key, val in DEFAULT_CABLE_POSE.items():
             self.declare_parameter(f"cable_{key}", val)
+
+        # Scene randomization controls.
+        self.declare_parameter("randomize_scene", True)
+        self.declare_parameter("random_seed", -1)
+
+        # Per-rail-type sampling bounds (mirror aic_engine task_board_limits).
+        self.declare_parameter("nic_rail_min_translation", -0.0215)
+        self.declare_parameter("nic_rail_max_translation", 0.0234)
+        self.declare_parameter("nic_rail_min_yaw", -0.1745)  # -10 deg
+        self.declare_parameter("nic_rail_max_yaw", 0.1745)   # +10 deg
+        self.declare_parameter("sc_rail_min_translation", -0.06)
+        self.declare_parameter("sc_rail_max_translation", 0.055)
+        self.declare_parameter("mount_rail_min_translation", -0.09425)
+        self.declare_parameter("mount_rail_max_translation", 0.09425)
+        self.declare_parameter("mount_rail_min_yaw", -1.047)  # -60 deg
+        self.declare_parameter("mount_rail_max_yaw", 1.047)   # +60 deg
+
+        # Per-component presence + fallback pose (used when randomize_scene=false
+        # or for components whose pose this node does not randomize).
+        for name in NIC_MOUNT_RAILS + SC_PORT_MOUNT_RAILS + PICK_MOUNTS:
+            self.declare_parameter(f"{name}_present", False)
+            self.declare_parameter(f"{name}_translation", 0.0)
+            self.declare_parameter(f"{name}_roll", 0.0)
+            self.declare_parameter(f"{name}_pitch", 0.0)
+            self.declare_parameter(f"{name}_yaw", 0.0)
+
+        seed = self.get_parameter("random_seed").value
+        self._rng = random.Random(seed if seed >= 0 else None)
 
         self.delete_entity_client = self.create_client(
             DeleteEntity, "/gz_server/delete_entity", callback_group=cb_group
@@ -166,14 +199,67 @@ class EpisodeResetNode(Node):
             return result.entity_name
         return None
 
+    def _build_scene_xacro_args(self):
+        """Build the full xacro-arg dict for task-board components.
+
+        Presence flags are static per run. Translation (and yaw, where the rail
+        type supports it) is resampled per call when randomize_scene is True.
+        """
+        randomize = bool(self.get_parameter("randomize_scene").value)
+        xacro_args = {}
+
+        def sample_param_range(lower_bound, upper_bound):
+            lower_value = self.get_parameter(lower_bound).value
+            upper_value = self.get_parameter(upper_bound).value
+            return self._rng.uniform(lower_value, upper_value)
+
+        def generate_static_pose(name):
+            return {
+                "translation": float(self.get_parameter(f"{name}_translation").value),
+                "roll": float(self.get_parameter(f"{name}_roll").value),
+                "pitch": float(self.get_parameter(f"{name}_pitch").value),
+                "yaw": float(self.get_parameter(f"{name}_yaw").value),
+            }
+
+        # NIC cards: translation + yaw randomized.
+        for name in NIC_MOUNT_RAILS:
+            present = bool(self.get_parameter(f"{name}_present").value)
+            pose = generate_static_pose(name)
+            if present and randomize:
+                pose["translation"] = sample_param_range("nic_rail_min_translation", "nic_rail_max_translation")
+                pose["yaw"] = sample_param_range("nic_rail_min_yaw", "nic_rail_max_yaw")
+            xacro_args[f"{name}_present"] = str(present).lower()
+            for k, v in pose.items():
+                xacro_args[f"{name}_{k}"] = str(v)
+
+        # SC ports: translation only randomized.
+        for name in SC_PORT_MOUNT_RAILS:
+            present = bool(self.get_parameter(f"{name}_present").value)
+            pose = generate_static_pose(name)
+            if present and randomize:
+                pose["translation"] = sample_param_range("sc_rail_min_translation", "sc_rail_max_translation")
+            xacro_args[f"{name}_present"] = str(present).lower()
+            for k, v in pose.items():
+                xacro_args[f"{name}_{k}"] = str(v)
+
+        # Pick-fixture mount rails: not randomized here, pass through params.
+        for name in PICK_MOUNTS:
+            present = bool(self.get_parameter(f"{name}_present").value)
+            pose = generate_static_pose(name)
+            xacro_args[f"{name}_present"] = str(present).lower()
+            for k, v in pose.items():
+                xacro_args[f"{name}_{k}"] = str(v)
+
+        sampled = {k: v for k, v in xacro_args.items() if k.endswith(("_translation", "_yaw"))}
+        self.get_logger().info(f"Sampled scene args: {sampled}")
+        return xacro_args
+
     def _spawn_task_board(self):
         desc = get_package_share_directory("aic_description")
         pose = {k: self.get_parameter(f"task_board_{k}").value for k in DEFAULT_TASK_BOARD_POSE}
         xacro_args = {
             **{k: str(v) for k, v in pose.items()},
-            "nic_card_mount_0_present": str(self.get_parameter("nic_card_mount_0_present").value).lower(),
-            "nic_card_mount_0_translation": str(self.get_parameter("nic_card_mount_0_translation").value),
-            "nic_card_mount_0_yaw": str(self.get_parameter("nic_card_mount_0_yaw").value),
+            **self._build_scene_xacro_args(),
         }
         sdf = self._run_xacro(f"{desc}/urdf/task_board.urdf.xacro", xacro_args)
         if not sdf:
