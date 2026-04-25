@@ -24,6 +24,7 @@ Options for `--teleop.type` (and setting `--robot.teleop_target_mode` accordingl
 - `aic_keyboard_ee` for cartesian-space keyboard control (and set `--robot.teleop_target_mode=cartesian`)
 - `aic_spacemouse` for cartesian-space SpaceMouse control (and set `--robot.teleop_target_mode=cartesian`)
 - `aic_keyboard_joint` for joint-space control (and set `--robot.teleop_target_mode=joint`)
+- `cheatcode` for scripted cable-insertion trajectories with OU perturbations (and set `--robot.teleop_target_mode=pose`) — see [Automated Data Collection via CheatCode](#automated-data-collection-via-cheatcode) below.
 
 Options for `--robot.teleop_frame_id` when `--robot.teleop_target_mode` is `cartesian`:
 - `base_link` to send cartesian targets with respect to the robot's base link.
@@ -137,6 +138,57 @@ LeRobot recording keys:
 | ESC         | Stop recording   |
 
 <!-- TODO: lerobot-record doesn't load the hil processor to handle teleop events (lerobot bug?) -->
+
+### Automated Data Collection via CheatCode
+
+The `cheatcode` teleoperator replays the scripted approach→descend→hold
+trajectory from `aic_example_policies/ros/CheatCode.py` as an in-process
+action source for `lerobot-record`, with Ornstein–Uhlenbeck perturbations
+on the commanded pose to reproduce teleop-style overshoot-and-correct
+behavior. Actions are recorded as Cartesian **pose targets**
+(`--robot.teleop_target_mode=pose`) using `MODE_POSITION`.
+
+**Prerequisites:**
+1. Bringup must be launched with ground-truth TFs on
+   (`ground_truth:=true`) so `{cable}/{plug}_link` and
+   `{task_board}/{port}_link` are published.
+2. **Strongly recommended:** launch `episode_reset_node` with
+   `randomize_start_pose:=true` so each episode starts from a different
+   robot home pose (±6 cm XYZ). Without this, every episode has an
+   identical initial observation and the dataset is useless for training.
+3. The task (cable/plug/module/port names) must be passed to the teleop;
+   pass them as CLI flags (defaults shown) or adjust for your task.
+
+**Example** (use `aic-record`, **not** `lerobot-record` — `aic-record` is the
+in-repo wrapper that calls `robot.reset()` between episodes, which is what
+triggers `randomize_start_pose`):
+```bash
+cd ~/ws_aic/src/aic
+pixi run aic-record \
+  --robot.type=aic_controller --robot.id=aic \
+  --robot.teleop_target_mode=pose \
+  --teleop.type=cheatcode --teleop.id=aic \
+  --teleop.cable_name=cable_0 --teleop.plug_name=sfp_tip \
+  --teleop.target_module_name=nic_card_mount_0 --teleop.port_name=sfp_port_0 \
+  --teleop.approach_noise_xyz_m=0.004 \
+  --teleop.descent_noise_xyz_m=0.001 \
+  --dataset.repo_id=local/aic_cheatcode \
+  --dataset.single_task="insert sfp cable" \
+  --dataset.num_episodes=50 \
+  --dataset.episode_time_s=25 \
+  --dataset.push_to_hub=false \
+  --play_sounds=false
+```
+
+The teleop runs a state machine: APPROACH (ramps to a pose ~20 cm above
+the port over ~5 s) → DESCEND (z_offset decreases each tick) → HOLD
+(maintains the final pose after insertion succeeds). Episode boundaries
+are driven by `--dataset.episode_time_s`; size it to comfortably cover
+approach + descend + a dwell margin.
+
+Success detection (plug–port xy distance < 2 mm, |z| < 1 mm held for
+~10 ticks) gates the transition to HOLD and is logged; it does not by
+itself terminate the lerobot episode.
 
 ### Training
 

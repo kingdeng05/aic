@@ -12,7 +12,7 @@ from lerobot.configs import parser
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import combine_feature_dicts
+from lerobot.datasets.feature_utils import combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor.rename_processor import rename_stats
@@ -152,6 +152,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     if hasattr(robot, "reset"):
                         robot.reset()
 
+                    # Clear per-episode teleop state (OU bias, phase,
+                    # integrator, cached last action) so episode 2+
+                    # doesn't inherit the prior episode's HOLD pose.
+                    if teleop is not None and hasattr(teleop, "reset"):
+                        teleop.reset()
+
                     record_loop(
                         robot=robot,
                         events=events,
@@ -164,6 +170,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
+
+                    # Reset teleop AGAIN after the reset window: the
+                    # reset record_loop above polls get_action() and
+                    # consumes fresh APPROACH ticks, so by now phase
+                    # would be mid-approach (or DESCEND) with stale
+                    # OU bias. Re-reset so the next real episode starts
+                    # clean from the randomized home pose.
+                    if teleop is not None and hasattr(teleop, "reset"):
+                        teleop.reset()
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
