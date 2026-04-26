@@ -90,9 +90,6 @@ def calc_gripper_pose(
 ) -> tuple[Pose, tuple[float, float, float]]:
     """Port of CheatCode.calc_gripper_pose.
 
-    Returns the target gripper Pose AND the current (plug_xyz) so callers
-    can compute a success predicate without re-looking up the TF.
-
     When `descent_in_port_frame` is True, the plug-tip target is built in the
     port's local frame: target_plug_in_port = (i_gain*int.x, i_gain*int.y,
     z_offset). The gripper target then accounts for the rigid plug-in-gripper
@@ -162,9 +159,16 @@ def calc_gripper_pose(
         else:
             integrator.step(-float(plug_in_port[0]), -float(plug_in_port[1]))
 
-        target_plug_in_port = np.array(
-            [i_gain * integrator.x, i_gain * integrator.y, z_offset]
-        )
+        # Port-frame z-axis points INTO the board (R_port_z ≈ -world_up in
+        # this scene), so a positive `z_offset` (meaning "above port" in
+        # world terms) maps to a negative coordinate along the port's local
+        # z. Negate so callers can keep using the same approach/descent
+        # offsets they used for the world-frame branch.
+        target_plug_in_port = np.array([
+            i_gain * integrator.x,
+            i_gain * integrator.y,
+            -z_offset,
+        ])
         target_plug_in_base = R_port @ target_plug_in_port + p_port
 
         # Constant rigid offset of plug in gripper frame, derived live from TF.
