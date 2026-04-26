@@ -73,6 +73,12 @@ class CheatCodeTeleopConfig(TeleoperatorConfig):
     integrator_max_windup: float = 0.05
     integrator_i_gain: float = 0.15
 
+    # If True, build the descent target in the port's local frame so the
+    # insertion axis follows the port's orientation rather than world z. More
+    # robust to randomized port poses; flagged for A/B against the legacy
+    # world-frame descent.
+    descent_in_port_frame: bool = True
+
     # Per-tick slew limit on commanded pose (defense against episode-
     # boundary discontinuities or TF hiccups). Disable by setting <=0.
     max_step_xyz_m: float = 0.02
@@ -331,6 +337,7 @@ class CheatCodeTeleop(Teleoperator):
                 z_offset=z_offset,
                 reset_xy_integrator=reset_integrator,
                 i_gain=self.config.integrator_i_gain,
+                descent_in_port_frame=self.config.descent_in_port_frame,
             )
         except TransformException as ex:
             if self._node is not None:

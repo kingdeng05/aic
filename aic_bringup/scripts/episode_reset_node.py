@@ -294,9 +294,8 @@ class EpisodeResetNode(Node):
             self._delete_entity(self.spawned_task_board_name)
             time.sleep(1.0)
 
-            # Step 2: Home robot to nominal pose (no offset yet — cable needs
-            # the gripper at the fixed spawn location to attach properly).
-            if not self._run_helper("home"):
+            # Step 2: Drive robot to home and hold it in joint mode.
+            if not self._run_helper("robot_home_init"):
                 response.success = False
                 response.message = "Failed to home robot"
                 return response
@@ -307,7 +306,6 @@ class EpisodeResetNode(Node):
                 response.success = False
                 response.message = "Failed to spawn task board"
                 return response
-            time.sleep(1.0)
 
             # Step 4: Respawn cable (attaches to gripper at nominal home)
             self.get_logger().info("Respawning cable...")
@@ -316,7 +314,15 @@ class EpisodeResetNode(Node):
                 response.message = "Failed to spawn cable"
                 return response
 
-            # Step 5: Apply random Cartesian offset AFTER cable is attached,
+            # Step 5: With the plug rigidly attached, switch the controller
+            # back to Cartesian mode and tare the FT sensor.
+            time.sleep(0.5)
+            if not self._run_helper("robot_home_finalize"):
+                response.success = False
+                response.message = "Failed to finalize home"
+                return response
+
+            # Step 6: Apply random Cartesian offset AFTER cable is attached,
             # so the gripper+cable move together to the randomized start pose.
             randomize = self.get_parameter("randomize_start_pose").value
             if randomize:
