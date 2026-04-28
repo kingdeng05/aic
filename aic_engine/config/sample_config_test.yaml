@@ -296,9 +296,9 @@ trials:
         time_limit: 180
 robot:
   home_joint_positions:
-    shoulder_pan_joint: -1.726
-    shoulder_lift_joint: 0.008
-    elbow_joint: -1.335
-    wrist_1_joint: -0.147
-    wrist_2_joint: -1.651
-    wrist_3_joint: 1.571
+    shoulder_pan_joint: -0.1597
+    shoulder_lift_joint: -1.3542
+    elbow_joint: -1.6648
+    wrist_1_joint: -1.6933
+    wrist_2_joint: 1.5710
+    wrist_3_joint: 1.4110

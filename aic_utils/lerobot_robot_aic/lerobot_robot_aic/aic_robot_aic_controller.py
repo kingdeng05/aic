@@ -34,7 +34,15 @@ from aic_control_interfaces.msg import (
     TrajectoryGenerationMode,
 )
 from aic_control_interfaces.srv import ChangeTargetMode
-from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, Wrench
+from geometry_msgs.msg import (
+    Point,
+    Pose,
+    Quaternion,
+    Twist,
+    Vector3,
+    Wrench,
+    WrenchStamped,
+)
 from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots import Robot, RobotConfig
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -88,6 +96,12 @@ ObservationState = TypedDict(
         "joint_positions.4": float,
         "joint_positions.5": float,
         "joint_positions.6": float,
+        "wrench.force.x": float,
+        "wrench.force.y": float,
+        "wrench.force.z": float,
+        "wrench.torque.x": float,
+        "wrench.torque.y": float,
+        "wrench.torque.z": float,
     },
 )
 
@@ -128,6 +142,7 @@ class AICRos2Interface:
     joint_motion_update_pub: Publisher[JointMotionUpdate]
     controller_state_sub: Subscription[ControllerState]
     joint_states_sub: Subscription[JointState]
+    wrench_sub: Subscription[WrenchStamped]
     episode_reset_client: Client[Trigger.Request, Trigger.Response]
     logger: RcutilsLogger
 
@@ -135,6 +150,7 @@ class AICRos2Interface:
     def connect(
         controller_state_cb: Callable[[ControllerState], None],
         joint_states_cb: Callable[[JointState], None],
+        wrench_cb: Callable[[WrenchStamped], None],
     ) -> "AICRos2Interface":
         if not rclpy.ok():
             rclpy.init()
@@ -169,6 +185,13 @@ class AICRos2Interface:
             JointState, "/joint_states", joint_states_cb, qos_profile_sensor_data
         )
 
+        wrench_sub = node.create_subscription(
+            WrenchStamped,
+            "/fts_broadcaster/wrench",
+            wrench_cb,
+            qos_profile_sensor_data,
+        )
+
         episode_reset_client = node.create_client(Trigger, "/episode_reset")
 
         executor = SingleThreadedExecutor()
@@ -186,6 +209,7 @@ class AICRos2Interface:
             joint_motion_update_pub=joint_motion_update_pub,
             controller_state_sub=controller_state_sub,
             joint_states_sub=joint_states_sub,
+            wrench_sub=wrench_sub,
             episode_reset_client=episode_reset_client,
             logger=logger,
         )
@@ -201,6 +225,7 @@ class AICRobotAICController(Robot):
         self.ros2_interface: AICRos2Interface | None = None
         self.last_controller_state: ControllerState | None = None
         self.last_joint_states: JointState | None = None
+        self.last_wrench: WrenchStamped | None = None
 
         self._is_connected = False
 
@@ -292,8 +317,11 @@ class AICRobotAICController(Robot):
         def joint_states_cb(msg: JointState):
             self.last_joint_states = msg
 
+        def wrench_cb(msg: WrenchStamped):
+            self.last_wrench = msg
+
         self.ros2_interface = AICRos2Interface.connect(
-            controller_state_cb, joint_states_cb
+            controller_state_cb, joint_states_cb, wrench_cb
         )
 
         # "pose" uses the Cartesian admittance controller with MODE_POSITION
@@ -324,13 +352,35 @@ class AICRobotAICController(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if not self.last_controller_state or not self.last_joint_states:
+        if (
+            not self.last_controller_state
+            or not self.last_joint_states
+            or not self.last_wrench
+        ):
             return {}
 
         tcp_pose = self.last_controller_state.tcp_pose
         tcp_velocity = self.last_controller_state.tcp_velocity
         tcp_error = self.last_controller_state.tcp_error
         joint_positions = self.last_joint_states.position
+        # `/fts_broadcaster/wrench` is RAW (pre-tare). The controller captures
+        # the bias on tare in `controller_state.fts_tare_offset`; subtract it
+        # so recorded values reflect contact forces (≈0 in free space) rather
+        # than the cable-weight bias projected onto the wrist frame.
+        raw_w = self.last_wrench.wrench
+        tare_w = self.last_controller_state.fts_tare_offset.wrench
+        wrench = Wrench(
+            force=Vector3(
+                x=raw_w.force.x - tare_w.force.x,
+                y=raw_w.force.y - tare_w.force.y,
+                z=raw_w.force.z - tare_w.force.z,
+            ),
+            torque=Vector3(
+                x=raw_w.torque.x - tare_w.torque.x,
+                y=raw_w.torque.y - tare_w.torque.y,
+                z=raw_w.torque.z - tare_w.torque.z,
+            ),
+        )
         controller_state_obs: ObservationState = {
             "tcp_pose.position.x": tcp_pose.position.x,
             "tcp_pose.position.y": tcp_pose.position.y,
@@ -358,6 +408,12 @@ class AICRobotAICController(Robot):
             "joint_positions.4": joint_positions[4],
             "joint_positions.5": joint_positions[5],
             "joint_positions.6": joint_positions[6],
+            "wrench.force.x": wrench.force.x,
+            "wrench.force.y": wrench.force.y,
+            "wrench.force.z": wrench.force.z,
+            "wrench.torque.x": wrench.torque.x,
+            "wrench.torque.y": wrench.torque.y,
+            "wrench.torque.z": wrench.torque.z,
         }
 
         # Capture images from cameras
