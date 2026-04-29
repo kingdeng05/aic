@@ -1,14 +1,9 @@
 # python artifacts
 __pycache__/
 *.egg-info/
+build/
 files.txt
 outputs
-
-# colcon artifacts
-build/
-install/
-log/
-CMakeFiles/
 
 # pixi environments
 .pixi/*
