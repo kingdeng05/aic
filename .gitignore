@@ -5,6 +5,11 @@ build/
 files.txt
 outputs
 
+# colcon / ros2 build artifacts
+CMakeFiles/
+install/
+log/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
