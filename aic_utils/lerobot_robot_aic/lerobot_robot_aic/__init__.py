@@ -24,3 +24,7 @@ from .aic_teleop import (
     AICSpaceMouseTeleopConfig,
 )
 from .cheatcode_teleop import CheatCodeTeleop, CheatCodeTeleopConfig
+from .hybrid_teleop import (
+    HybridCheatCodeKeyboardTeleop,
+    HybridCheatCodeKeyboardTeleopConfig,
+)
