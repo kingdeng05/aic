@@ -66,7 +66,7 @@ class HybridCheatCodeKeyboardTeleopConfig(TeleoperatorConfig):
     # insertion axis follows the port's orientation rather than world z. More
     # robust to randomized port poses; flagged for A/B against the legacy
     # world-frame descent.
-    descent_in_port_frame: bool = True
+    descent_in_port_frame: bool = False
 
     # Per-tick slew limit on commanded pose (defense against episode-
     # boundary discontinuities or TF hiccups). Disable by setting <=0.
