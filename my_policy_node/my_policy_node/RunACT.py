@@ -56,7 +56,9 @@ class RunACT(Policy):
         # -------------------------------------------------------------------------
         policy_path = Path(os.environ.get(
             "AIC_ACT_MODEL_PATH",
-            "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
+            # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
+            # "/home/fuheng/ws_aic/src/aic/outputs/train/cheatcode-nic-30/checkpoints/100000/pretrained_model",
+            "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v6/checkpoints/040000/pretrained_model",
         ))
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
@@ -193,7 +195,7 @@ class RunACT(Policy):
         }
 
         # --- Process Robot State ---
-        # Construct flat state vector (26 dims) matching training order
+        # 32-dim state matching the training adapter (see aic_robot_aic_controller.py).
         tcp_pose = obs_msg.controller_state.tcp_pose
         tcp_vel = obs_msg.controller_state.tcp_velocity
 
@@ -212,6 +214,12 @@ class RunACT(Policy):
             ctrl[4],  # wrist_2
             ctrl[5],  # wrist_3
         ]
+
+        # /fts_broadcaster/wrench is RAW (pre-tare). Training data subtracts
+        # controller_state.fts_tare_offset; mirror that here so inference state
+        # ≈0 in free space matches the training distribution.
+        raw_w = obs_msg.wrist_wrench.wrench
+        tare_w = obs_msg.controller_state.fts_tare_offset.wrench
 
         state_np = np.array(
             [
@@ -236,6 +244,13 @@ class RunACT(Policy):
                 *obs_msg.controller_state.tcp_error,
                 # Joint Positions (7) in alphabetical order to match training
                 *joints_alpha,
+                # Tared wrench (6): force xyz, torque xyz
+                raw_w.force.x - tare_w.force.x,
+                raw_w.force.y - tare_w.force.y,
+                raw_w.force.z - tare_w.force.z,
+                raw_w.torque.x - tare_w.torque.x,
+                raw_w.torque.y - tare_w.torque.y,
+                raw_w.torque.z - tare_w.torque.z,
             ],
             dtype=np.float32,
         )
@@ -264,7 +279,7 @@ class RunACT(Policy):
         start_time = time.time()
 
         # Run inference for 30 seconds
-        while time.time() - start_time < 30.0:
+        while time.time() - start_time < 120.0:
             loop_start = time.time()
 
             # 1. Get & Process Observation
