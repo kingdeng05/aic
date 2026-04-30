@@ -36,8 +36,11 @@ from aic_task_interfaces.msg import Task
 
 from aic_control_interfaces.msg import (
     JointMotionUpdate,
+    TargetMode,
     TrajectoryGenerationMode,
 )
+from aic_control_interfaces.srv import ChangeTargetMode
+from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 # LeRobot & Safetensors
@@ -58,7 +61,8 @@ class RunACT(Policy):
             "AIC_ACT_MODEL_PATH",
             # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
             # "/home/fuheng/ws_aic/src/aic/outputs/train/cheatcode-nic-30/checkpoints/100000/pretrained_model",
-            "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v6/checkpoints/040000/pretrained_model",
+            # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v7/checkpoints/100000/pretrained_model",
+            "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v8/checkpoints/060000/pretrained_model",
         ))
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
@@ -129,6 +133,17 @@ class RunACT(Policy):
 
         # Config
         self.image_scaling = 0.25  # Must match AICRobotAICControllerConfig
+
+        # Service clients for episode prep. Re-tare so the wrench input matches
+        # the training distribution (training data was recorded with tared wrench).
+        # Force JOINT target mode so joint_motion_updates aren't silently dropped
+        # if the controller was left in CARTESIAN by a reset helper.
+        self._tare_client = parent_node.create_client(
+            Trigger, "/aic_controller/tare_force_torque_sensor"
+        )
+        self._change_target_mode_client = parent_node.create_client(
+            ChangeTargetMode, "/aic_controller/change_target_mode"
+        )
 
         self.get_logger().info("Normalization statistics loaded successfully.")
 
@@ -273,8 +288,24 @@ class RunACT(Policy):
     ):
         self.policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
-        # Note: aic_model.handle_joint_motion_update auto-switches controller to JOINT mode
-        # on the first joint_motion_update call, so no manual mode switch is needed.
+
+        # Force JOINT mode. aic_model caches its own _target_mode and may skip
+        # its switch service call if it thinks we're already in JOINT, so we
+        # call directly to make sure the controller actually accepts joint cmds.
+        if self._change_target_mode_client.wait_for_service(timeout_sec=2.0):
+            req = ChangeTargetMode.Request()
+            req.target_mode.mode = TargetMode.MODE_JOINT
+            self._change_target_mode_client.call(req)
+
+        # Re-tare FTS so the policy's wrench input is centered like the training
+        # distribution. Training data subtracted controller_state.fts_tare_offset;
+        # if no tare call has happened this episode, that offset is zero and the
+        # policy sees the raw 20+N gravity load — far OOD.
+        if self._tare_client.wait_for_service(timeout_sec=2.0):
+            self._tare_client.call(Trigger.Request())
+            self.get_logger().info("FTS tared at episode start.")
+        else:
+            self.get_logger().warn("Tare service unavailable; proceeding un-tared.")
 
         start_time = time.time()
 
