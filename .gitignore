@@ -5,6 +5,11 @@ build/
 files.txt
 outputs
 
+# colcon build artifacts
+CMakeFiles/
+install/
+log/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
