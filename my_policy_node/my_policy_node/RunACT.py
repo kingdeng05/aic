@@ -62,7 +62,8 @@ class RunACT(Policy):
             # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
             # "/home/fuheng/ws_aic/src/aic/outputs/train/cheatcode-nic-30/checkpoints/100000/pretrained_model",
             # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v7/checkpoints/100000/pretrained_model",
-            "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v8/checkpoints/060000/pretrained_model",
+            # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v8/checkpoints/060000/pretrained_model",
+            "/home/fuheng/ws_aic/src/aic/outputs/train/sfp0-nic0-rand-2-joints/checkpoints/080000/pretrained_model",
         ))
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
