@@ -5,6 +5,7 @@ for any robot that implements it (not just unitree_g1).
 """
 
 import logging
+import shutil
 from dataclasses import asdict
 from pprint import pformat
 
@@ -69,6 +70,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    discard_dataset = False
 
     try:
         if cfg.resume:
@@ -195,7 +197,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     if cfg.dataset.num_episodes == 1:
                         # Single-episode workflow: left arrow means discard
                         # and exit. Re-running the launch produces a fresh
-                        # randomized scene under a new dataset name.
+                        # randomized scene under a new dataset name. Mark for
+                        # rmtree in the finally clause so a discarded take
+                        # leaves no empty dataset directory behind.
+                        discard_dataset = True
                         break
                     continue
 
@@ -205,7 +210,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if dataset:
-            dataset.finalize()
+            if discard_dataset:
+                dataset_root = dataset.root
+                # Stop image writers so they don't write into a doomed dir.
+                if getattr(dataset, "image_writer", None) is not None:
+                    try:
+                        dataset.stop_image_writer()
+                    except Exception as e:
+                        logging.warning(f"image_writer stop failed: {e}")
+                shutil.rmtree(dataset_root, ignore_errors=True)
+                log_say("Discarded dataset directory", cfg.play_sounds)
+            else:
+                dataset.finalize()
 
         if robot.is_connected:
             robot.disconnect()
@@ -215,7 +231,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if cfg.dataset.push_to_hub and not discard_dataset:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
         log_say("Exiting", cfg.play_sounds)

@@ -187,6 +187,9 @@ ${HOME_OFFSET_SUMMARY}
     --teleop.type=cheatcode --teleop.id=aic \\
     --teleop.cable_name=cable_0 --teleop.plug_name=sfp_tip \\
     --teleop.target_module_name=${TARGET} --teleop.port_name=sfp_port_0 \\
+    --teleop.approach_noise_xyz_m=0 \\
+    --teleop.descent_noise_xyz_m=0 \\
+    --teleop.approach_rot_noise_deg=0 \\
     --robot.teleop_target_mode=pose --robot.teleop_frame_id=gripper/tcp \\
     --dataset.repo_id=${REPO_ID} \\
     --dataset.single_task="Insert SFP SC cable into NIC card port" \\
