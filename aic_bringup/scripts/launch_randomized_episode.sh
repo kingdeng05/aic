@@ -29,20 +29,22 @@ EPISODE_TIME_S=600
 DATASET_PREFIX="cheatcode"
 SEED=$RANDOM
 RANDOMIZE=1
+RANDOM_HOME_OFFSET="0.06"
 DRY_RUN=0
 LAUNCH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target=*)         TARGET="${1#*=}";          shift ;;
-        --cable-type=*)     CABLE_TYPE="${1#*=}";      shift ;;
-        --episode-time-s=*) EPISODE_TIME_S="${1#*=}";  shift ;;
-        --dataset-prefix=*) DATASET_PREFIX="${1#*=}";  shift ;;
-        --seed=*)           SEED="${1#*=}";            shift ;;
-        --no-randomize)     RANDOMIZE=0;               shift ;;
-        --dry-run)          DRY_RUN=1;                 shift ;;
-        --)                 shift; LAUNCH_ARGS+=("$@"); break ;;
-        *:=*)               LAUNCH_ARGS+=("$1");       shift ;;
+        --target=*)             TARGET="${1#*=}";              shift ;;
+        --cable-type=*)         CABLE_TYPE="${1#*=}";          shift ;;
+        --episode-time-s=*)     EPISODE_TIME_S="${1#*=}";      shift ;;
+        --dataset-prefix=*)     DATASET_PREFIX="${1#*=}";      shift ;;
+        --seed=*)               SEED="${1#*=}";                shift ;;
+        --random-home-offset=*) RANDOM_HOME_OFFSET="${1#*=}";  shift ;;
+        --no-randomize)         RANDOMIZE=0;                   shift ;;
+        --dry-run)              DRY_RUN=1;                     shift ;;
+        --)                     shift; LAUNCH_ARGS+=("$@"); break ;;
+        *:=*)                   LAUNCH_ARGS+=("$1");           shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -95,6 +97,48 @@ if [[ -z "$TARGET" ]]; then
     done
 fi
 
+# Sample home offset (dx, dy, dz) once and forward to home_robot.py via
+# home_x/y/z launch params. Cable is NOT shifted: at launch the gripper homes
+# to its default position first, the cable spawns at the matching default world
+# pose, CablePlugin attaches plug→gripper cleanly, and only then does
+# home_robot.py translate the gripper by d (~10s later via the launch event
+# handler). The cable rides along on the welded joint, so the plug stays
+# seated in the gripper at the new home.
+HOME_OFFSET_ARGS=()
+HOME_OFFSET_SUMMARY=""
+if [[ "$RANDOM_HOME_OFFSET" != "0" && "$RANDOM_HOME_OFFSET" != "0.0" ]]; then
+    HOME_PY_OUT=$(SEED="$SEED" OFFSET="$RANDOM_HOME_OFFSET" python3 - <<'PYEOF'
+import os, random
+rng = random.Random(int(os.environ["SEED"]))
+m = float(os.environ["OFFSET"])
+# NOMINAL_HOME_POS from aic_bringup/scripts/_reset_helper.py.
+home_xyz = (-0.3719, 0.1943, 0.3286)
+dx, dy, dz = rng.uniform(-m, m), rng.uniform(-m, m), rng.uniform(-m, m)
+args = [
+    "home_on_startup:=true",
+    f"home_x:={home_xyz[0]+dx:.6f}",
+    f"home_y:={home_xyz[1]+dy:.6f}",
+    f"home_z:={home_xyz[2]+dz:.6f}",
+]
+summary = (
+    f"  dx = {dx:+.4f} m   dy = {dy:+.4f} m   dz = {dz:+.4f} m\n"
+    f"  TCP home = ({home_xyz[0]+dx:+.4f}, {home_xyz[1]+dy:+.4f}, {home_xyz[2]+dz:+.4f})\n"
+    f"  cable    = launch defaults (welded joint moves with gripper)"
+)
+print(" ".join(args))
+print("---SUMMARY---")
+print(summary)
+PYEOF
+)
+    HOME_OFFSET_ARGS_LINE="${HOME_PY_OUT%%$'\n---SUMMARY---'*}"
+    HOME_OFFSET_SUMMARY="${HOME_PY_OUT##*---SUMMARY---$'\n'}"
+    # shellcheck disable=SC2206
+    HOME_OFFSET_ARGS=($HOME_OFFSET_ARGS_LINE)
+else
+    HOME_OFFSET_ARGS=("home_on_startup:=false")
+    HOME_OFFSET_SUMMARY="  disabled (--random-home-offset=0)"
+fi
+
 TS=$(date +%s)
 REPO_ID="local/${DATASET_PREFIX}-${TS}"
 
@@ -135,6 +179,8 @@ cat >&2 <<EOF
 [sim] target=${TARGET:-<none — pass <slot>_present:=true>}
 [sim] scene:
 ${SCENE_SUMMARY}
+[sim] home offset (--random-home-offset=${RANDOM_HOME_OFFSET}):
+${HOME_OFFSET_SUMMARY}
 [record] paste this in another terminal:
   pixi run aic-record \\
     --robot.type=aic_controller --robot.id=aic \\
@@ -155,6 +201,7 @@ LAUNCH_CMD=(ros2 launch aic_bringup aic_gz_bringup.launch.py
     spawn_cable:=true
     "cable_type:=${CABLE_TYPE}"
     attach_cable_to_gripper:=true
+    "${HOME_OFFSET_ARGS[@]}"
     "${LAUNCH_ARGS[@]}")
 
 if [[ $DRY_RUN -eq 1 ]]; then
