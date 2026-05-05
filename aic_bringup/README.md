@@ -103,6 +103,19 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py [parameters]
 - `task_board_pitch` (default: `"0.0"`) - Task board spawn pitch orientation (radians)
 - `task_board_yaw` (default: `"0.0"`) - Task board spawn yaw orientation (radians)
 
+**Task Board Components** (forwarded to `spawn_task_board.launch.py`):
+
+All per-component args declared by `spawn_task_board.launch.py` (5 NIC card mounts, 2 SC ports, 2 LC mount rails, 2 SFP mount rails, 2 SC mount rails — each with `_present`/`_translation`/`_roll`/`_pitch`/`_yaw`) are accepted directly on this launch and forwarded as-is. All `_present` flags default to `"false"` — the task board spawns empty unless slots are explicitly opted in. See [`spawn_task_board.launch.py`](#2-spawn_task_boardlaunchpy) below for the full per-arg listing and translation ranges.
+
+Example:
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  spawn_task_board:=true \
+  nic_card_mount_0_present:=true \
+  nic_card_mount_0_translation:=0.012 \
+  nic_card_mount_0_yaw:=-0.08
+```
+
 **Cable Configuration:**
 - `spawn_cable` (default: `"false"`) - Whether to spawn the cable
 - `cable_description_file` (default: `"cable.sdf.xacro"`) - Cable SDF/XACRO file
@@ -283,6 +296,25 @@ ros2 launch aic_bringup spawn_task_board.launch.py \
   lc_mount_rail_0_present:=true \
   lc_mount_rail_0_translation:=0.05
 ```
+
+### Single-Episode Randomized Capture (`launch_randomized_episode.sh`)
+
+For per-launch CheatCode data collection with auto-sampled task-board randomization, the bringup ships a wrapper script:
+
+```bash
+~/ws_aic_challenge/src/aic/aic_bringup/scripts/launch_randomized_episode.sh \
+  nic_card_mount_0_present:=true
+```
+
+The script:
+- Auto-samples `_translation` / `_yaw` for any slot marked `_present:=true` (within the ranges in [`docs/task_board_description.md`](../docs/task_board_description.md)). Use `--seed=<int>` for reproducible sampling, `--no-randomize` to skip sampling, or pass explicit values to override.
+- Generates a unique `local/cheatcode-<timestamp>` dataset name per invocation.
+- Prints a ready-to-paste `pixi run aic-record` command for a second terminal.
+- Sources the workspace, starts `rmw_zenohd`, and execs the launch.
+
+Why per-launch instead of `/episode_reset`-driven multi-episode capture: setting `nic_card_mount_*_translation` / `_yaw` on the reset path leaves leaked nested-collision shells in the broadphase, which intermittently block plug insertion. Setting the same args at launch time is on the proven-clean path. See `~/.claude/plans/sharded-mixing-firefly.md` for full background.
+
+See [`launch_randomized_episode.sh`](scripts/launch_randomized_episode.sh) for all flags.
 
 ---
 

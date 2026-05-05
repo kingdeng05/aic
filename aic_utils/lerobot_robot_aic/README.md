@@ -148,43 +148,67 @@ on the commanded pose to reproduce teleop-style overshoot-and-correct
 behavior. Actions are recorded as Cartesian **pose targets**
 (`--robot.teleop_target_mode=pose`) using `MODE_POSITION`.
 
+**Workflow: one launch = one randomized scene = one episode.** Domain
+randomization runs at launch time (not via `/episode_reset`); each shell
+script invocation samples a fresh task-board scene, captures one episode,
+and exits. The outer loop is "re-run the script for the next sample".
+
 **Prerequisites:**
 1. Bringup must be launched with ground-truth TFs on
    (`ground_truth:=true`) so `{cable}/{plug}_link` and
    `{task_board}/{port}_link` are published.
-2. **Strongly recommended:** launch `episode_reset_node` with
-   `randomize_start_pose:=true` so each episode starts from a different
-   robot home pose (±6 cm XYZ). Without this, every episode has an
-   identical initial observation and the dataset is useless for training.
-3. The task (cable/plug/module/port names) must be passed to the teleop;
+2. The task (cable/plug/module/port names) must be passed to the teleop;
    pass them as CLI flags (defaults shown) or adjust for your task.
 
-**Example** (use `aic-record`, **not** `lerobot-record` — `aic-record` is the
-in-repo wrapper that calls `robot.reset()` between episodes, which is what
-triggers `randomize_start_pose`):
+**Recommended launch path** (uses
+[`launch_randomized_episode.sh`](../../aic_bringup/scripts/launch_randomized_episode.sh)
+to sample a randomized scene + emit a ready-to-paste record command):
+
+Terminal 1 — sim:
 ```bash
-cd ~/ws_aic/src/aic
+~/ws_aic_challenge/src/aic/aic_bringup/scripts/launch_randomized_episode.sh \
+  nic_card_mount_0_present:=true
+```
+
+The script prints a `[record] paste this in another terminal:` block.
+Copy that block once Gazebo is up.
+
+Terminal 2 — record (paste the printed command, e.g.):
+```bash
+cd ~/ws_aic_challenge/src/aic
 pixi run aic-record \
   --robot.type=aic_controller --robot.id=aic \
-  --robot.teleop_target_mode=pose \
   --teleop.type=cheatcode --teleop.id=aic \
   --teleop.cable_name=cable_0 --teleop.plug_name=sfp_tip \
   --teleop.target_module_name=nic_card_mount_0 --teleop.port_name=sfp_port_0 \
-  --teleop.approach_noise_xyz_m=0.004 \
-  --teleop.descent_noise_xyz_m=0.001 \
-  --dataset.repo_id=local/aic_cheatcode \
-  --dataset.single_task="insert sfp cable" \
-  --dataset.num_episodes=50 \
-  --dataset.episode_time_s=25 \
-  --dataset.push_to_hub=false \
-  --play_sounds=false
+  --robot.teleop_target_mode=pose --robot.teleop_frame_id=gripper/tcp \
+  --dataset.repo_id=local/cheatcode-<timestamp> \
+  --dataset.single_task="Insert SFP SC cable into NIC card port" \
+  --dataset.push_to_hub=false --play_sounds=false --display_data=false \
+  --dataset.num_episodes=1 --dataset.episode_time_s=600 --dataset.reset_time_s=0
 ```
 
 The teleop runs a state machine: APPROACH (ramps to a pose ~20 cm above
 the port over ~5 s) → DESCEND (z_offset decreases each tick) → HOLD
-(maintains the final pose after insertion succeeds). Episode boundaries
-are driven by `--dataset.episode_time_s`; size it to comfortably cover
-approach + descend + a dwell margin.
+(maintains the final pose after insertion succeeds). Size
+`--dataset.episode_time_s` to comfortably cover approach + descend + dwell.
+
+**Recording keys** (apply for one-shot capture; same as the LeRobot table above):
+- **Right Arrow** — end the episode and **save**. Use this once insertion is seated.
+- **Left Arrow** — discard the take and exit. With `--dataset.num_episodes=1`,
+  `aic-record` clears the episode buffer and breaks out cleanly (no re-record
+  attempt, no `robot.reset()` call).
+- **ESC** — stops recording. Falls through to `dataset.save_episode()`, so it
+  also saves whatever was captured. Right Arrow is preferred.
+
+After the episode terminates, kill the sim (Ctrl-C in Terminal 1) and re-run
+the shell script for the next sample — a new `cheatcode-<timestamp>` dataset
+name keeps every episode separate.
+
+`aic-record` short-circuits the inter-episode reset block whenever
+`--dataset.num_episodes == 1`, so `/episode_reset` does not need to be
+running. For legacy multi-episode flows where the reset service *is*
+running, `aic-record` still calls `robot.reset()` between episodes as before.
 
 Success detection (plug–port xy distance < 2 mm, |z| < 1 mm held for
 ~10 ticks) gates the transition to HOLD and is logged; it does not by

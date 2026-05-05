@@ -44,6 +44,21 @@ from ros_gz_bridge.actions import RosGzBridge
 from ros_gz_sim.actions import GzServer
 
 
+_COMPONENT_KEYS = ("present", "translation", "roll", "pitch", "yaw")
+NIC_CARD_MOUNT_ARGS = [f"nic_card_mount_{i}_{k}" for i in range(5) for k in _COMPONENT_KEYS]
+SC_PORT_ARGS = [f"sc_port_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+LC_MOUNT_RAIL_ARGS = [f"lc_mount_rail_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+SFP_MOUNT_RAIL_ARGS = [f"sfp_mount_rail_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+SC_MOUNT_RAIL_ARGS = [f"sc_mount_rail_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+TASK_BOARD_COMPONENT_ARGS = (
+    NIC_CARD_MOUNT_ARGS
+    + SC_PORT_ARGS
+    + LC_MOUNT_RAIL_ARGS
+    + SFP_MOUNT_RAIL_ARGS
+    + SC_MOUNT_RAIL_ARGS
+)
+
+
 def on_aic_engine_exit(event, context):
     if event.returncode != 0:
         raise RuntimeError(f"aic_engine exited with code {event.returncode}")
@@ -83,6 +98,9 @@ def launch_setup(context, *args, **kwargs):
     task_board_roll = LaunchConfiguration("task_board_roll")
     task_board_pitch = LaunchConfiguration("task_board_pitch")
     task_board_yaw = LaunchConfiguration("task_board_yaw")
+    task_board_component_configs = {
+        name: LaunchConfiguration(name) for name in TASK_BOARD_COMPONENT_ARGS
+    }
     cable_x = LaunchConfiguration("cable_x")
     cable_y = LaunchConfiguration("cable_y")
     cable_z = LaunchConfiguration("cable_z")
@@ -281,6 +299,7 @@ def launch_setup(context, *args, **kwargs):
             "task_board_roll": task_board_roll,
             "task_board_pitch": task_board_pitch,
             "task_board_yaw": task_board_yaw,
+            **task_board_component_configs,
         }.items(),
         condition=IfCondition(spawn_task_board),
     )
@@ -655,6 +674,16 @@ def generate_launch_description():
             description="Task board spawn yaw orientation (radians)",
         )
     )
+
+    for _name in TASK_BOARD_COMPONENT_ARGS:
+        _default = "false" if _name.endswith("_present") else "0.0"
+        declared_arguments.append(
+            DeclareLaunchArgument(
+                _name,
+                default_value=_default,
+                description=f"Forwarded to spawn_task_board.launch.py ({_name})",
+            )
+        )
 
     declared_arguments.append(
         DeclareLaunchArgument(
