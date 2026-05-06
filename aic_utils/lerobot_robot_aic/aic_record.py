@@ -5,6 +5,7 @@ for any robot that implements it (not just unitree_g1).
 """
 
 import logging
+import shutil
 from dataclasses import asdict
 from pprint import pformat
 
@@ -12,7 +13,7 @@ from lerobot.configs import parser
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import combine_feature_dicts
+from lerobot.datasets.feature_utils import combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor.rename_processor import rename_stats
@@ -69,6 +70,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    discard_dataset = False
 
     try:
         if cfg.resume:
@@ -152,19 +154,22 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_compressed_images=display_compressed_images,
                 )
 
-                # Reset between episodes (skip for last episode)
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                # Reset between episodes (skip for last episode, and skip
+                # entirely in single-episode mode where the workflow is
+                # one-launch-one-episode and /episode_reset is not running).
+                if (
+                    not events["stop_recording"]
+                    and cfg.dataset.num_episodes > 1
+                    and (
+                        (recorded_episodes < cfg.dataset.num_episodes - 1)
+                        or events["rerecord_episode"]
+                    )
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
-                    # Call robot.reset() for ANY robot that implements it
                     if hasattr(robot, "reset"):
                         robot.reset()
 
-                    # Clear per-episode teleop state (OU bias, phase,
-                    # integrator, cached last action) so episode 2+
-                    # doesn't inherit the prior episode's HOLD pose.
                     if teleop is not None and hasattr(teleop, "reset"):
                         teleop.reset()
 
@@ -181,20 +186,22 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         display_data=cfg.display_data,
                     )
 
-                    # Reset teleop AGAIN after the reset window: the
-                    # reset record_loop above polls get_action() and
-                    # consumes fresh APPROACH ticks, so by now phase
-                    # would be mid-approach (or DESCEND) with stale
-                    # OU bias. Re-reset so the next real episode starts
-                    # clean from the randomized home pose.
                     if teleop is not None and hasattr(teleop, "reset"):
                         teleop.reset()
 
                 if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
+                    log_say("Re-record episode (discarded)", cfg.play_sounds)
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    if cfg.dataset.num_episodes == 1:
+                        # Single-episode workflow: left arrow means discard
+                        # and exit. Re-running the launch produces a fresh
+                        # randomized scene under a new dataset name. Mark for
+                        # rmtree in the finally clause so a discarded take
+                        # leaves no empty dataset directory behind.
+                        discard_dataset = True
+                        break
                     continue
 
                 dataset.save_episode()
@@ -203,7 +210,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if dataset:
-            dataset.finalize()
+            if discard_dataset:
+                dataset_root = dataset.root
+                # Stop image writers so they don't write into a doomed dir.
+                if getattr(dataset, "image_writer", None) is not None:
+                    try:
+                        dataset.stop_image_writer()
+                    except Exception as e:
+                        logging.warning(f"image_writer stop failed: {e}")
+                shutil.rmtree(dataset_root, ignore_errors=True)
+                log_say("Discarded dataset directory", cfg.play_sounds)
+            else:
+                dataset.finalize()
 
         if robot.is_connected:
             robot.disconnect()
@@ -213,7 +231,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if cfg.dataset.push_to_hub and not discard_dataset:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
         log_say("Exiting", cfg.play_sounds)

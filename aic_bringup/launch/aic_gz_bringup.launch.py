@@ -24,6 +24,7 @@ from launch.actions import (
     OpaqueFunction,
     RegisterEventHandler,
     SetEnvironmentVariable,
+    TimerAction,
 )
 from launch.conditions import IfCondition, UnlessCondition
 from launch.event_handlers import OnProcessExit
@@ -42,6 +43,21 @@ from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from ros_gz_bridge.actions import RosGzBridge
 from ros_gz_sim.actions import GzServer
+
+
+_COMPONENT_KEYS = ("present", "translation", "roll", "pitch", "yaw")
+NIC_CARD_MOUNT_ARGS = [f"nic_card_mount_{i}_{k}" for i in range(5) for k in _COMPONENT_KEYS]
+SC_PORT_ARGS = [f"sc_port_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+LC_MOUNT_RAIL_ARGS = [f"lc_mount_rail_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+SFP_MOUNT_RAIL_ARGS = [f"sfp_mount_rail_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+SC_MOUNT_RAIL_ARGS = [f"sc_mount_rail_{i}_{k}" for i in range(2) for k in _COMPONENT_KEYS]
+TASK_BOARD_COMPONENT_ARGS = (
+    NIC_CARD_MOUNT_ARGS
+    + SC_PORT_ARGS
+    + LC_MOUNT_RAIL_ARGS
+    + SFP_MOUNT_RAIL_ARGS
+    + SC_MOUNT_RAIL_ARGS
+)
 
 
 def on_aic_engine_exit(event, context):
@@ -83,6 +99,9 @@ def launch_setup(context, *args, **kwargs):
     task_board_roll = LaunchConfiguration("task_board_roll")
     task_board_pitch = LaunchConfiguration("task_board_pitch")
     task_board_yaw = LaunchConfiguration("task_board_yaw")
+    task_board_component_configs = {
+        name: LaunchConfiguration(name) for name in TASK_BOARD_COMPONENT_ARGS
+    }
     cable_x = LaunchConfiguration("cable_x")
     cable_y = LaunchConfiguration("cable_y")
     cable_z = LaunchConfiguration("cable_z")
@@ -281,6 +300,7 @@ def launch_setup(context, *args, **kwargs):
             "task_board_roll": task_board_roll,
             "task_board_pitch": task_board_pitch,
             "task_board_yaw": task_board_yaw,
+            **task_board_component_configs,
         }.items(),
         condition=IfCondition(spawn_task_board),
     )
@@ -413,12 +433,42 @@ def launch_setup(context, *args, **kwargs):
         condition=IfCondition(launch_rviz),
     )
 
+    # Optional post-startup home of the gripper TCP to a (possibly randomized)
+    # Cartesian pose. Used by launch_randomized_episode.sh to randomize the
+    # robot home without translating the base. Fires ~10s after the AIC
+    # controller activates so the cable has had time to spawn and attach.
+    home_on_startup = LaunchConfiguration("home_on_startup")
+    home_robot_node = Node(
+        package="aic_bringup",
+        executable="home_robot.py",
+        output="screen",
+        parameters=[
+            {
+                "home_x": LaunchConfiguration("home_x"),
+                "home_y": LaunchConfiguration("home_y"),
+                "home_z": LaunchConfiguration("home_z"),
+                "home_qx": LaunchConfiguration("home_qx"),
+                "home_qy": LaunchConfiguration("home_qy"),
+                "home_qz": LaunchConfiguration("home_qz"),
+                "home_qw": LaunchConfiguration("home_qw"),
+            }
+        ],
+    )
+    delay_home_after_controller = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=initial_joint_controller_spawner_started,
+            on_exit=[TimerAction(period=10.0, actions=[home_robot_node])],
+        ),
+        condition=IfCondition(home_on_startup),
+    )
+
     nodes_to_start = [
         robot_state_publisher_node,
         delay_basic_controllers_after_spawn,
         delay_initial_controller_after_broadcaster,
         delay_rviz_after_controller_started,
         delay_rviz_after_controller_stopped,
+        delay_home_after_controller,
         aic_adapter,
         gz_ip_env,
         gzserver,
@@ -656,6 +706,16 @@ def generate_launch_description():
         )
     )
 
+    for _name in TASK_BOARD_COMPONENT_ARGS:
+        _default = "false" if _name.endswith("_present") else "0.0"
+        declared_arguments.append(
+            DeclareLaunchArgument(
+                _name,
+                default_value=_default,
+                description=f"Forwarded to spawn_task_board.launch.py ({_name})",
+            )
+        )
+
     declared_arguments.append(
         DeclareLaunchArgument(
             "attach_cable_to_gripper",
@@ -760,6 +820,34 @@ def generate_launch_description():
             description="Absolute path to YAML file with the AIC engine configuration.",
         )
     )
+
+    # Post-startup home pose (used by launch_randomized_episode.sh to
+    # randomize the gripper TCP without moving the robot base). Defaults
+    # mirror NOMINAL_HOME_POS / NOMINAL_HOME_QUAT in
+    # aic_bringup/scripts/_reset_helper.py.
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "home_on_startup",
+            default_value="false",
+            description=(
+                "If true, run home_robot.py automatically after the AIC "
+                "controller activates. Used to randomize the gripper TCP at "
+                "launch time."
+            ),
+        )
+    )
+    for _name, _default, _desc in [
+        ("home_x", "-0.3719", "Home TCP target X in base_link frame"),
+        ("home_y", "0.1943", "Home TCP target Y in base_link frame"),
+        ("home_z", "0.3286", "Home TCP target Z in base_link frame"),
+        ("home_qx", "1.0", "Home TCP target orientation X (quaternion)"),
+        ("home_qy", "0.0", "Home TCP target orientation Y (quaternion)"),
+        ("home_qz", "0.0", "Home TCP target orientation Z (quaternion)"),
+        ("home_qw", "0.0", "Home TCP target orientation W (quaternion)"),
+    ]:
+        declared_arguments.append(
+            DeclareLaunchArgument(_name, default_value=_default, description=_desc)
+        )
 
     return LaunchDescription(
         declared_arguments + [OpaqueFunction(function=launch_setup)]
