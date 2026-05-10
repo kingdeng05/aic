@@ -22,7 +22,7 @@ import numpy as np
 import cv2
 import draccus
 from pathlib import Path
-from typing import Callable, Dict, Any, List
+from typing import Dict
 from rclpy.node import Node
 
 from aic_model.policy import (
@@ -34,16 +34,53 @@ from aic_model.policy import (
 from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
 
-from aic_control_interfaces.msg import (
-    JointMotionUpdate,
-    TrajectoryGenerationMode,
-)
-from trajectory_msgs.msg import JointTrajectoryPoint
+from geometry_msgs.msg import Pose, Point, Quaternion
 
 # LeRobot & Safetensors
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.act.configuration_act import ACTConfig
 from safetensors.torch import load_file
+
+
+def _rot6d_to_matrix(d6: np.ndarray) -> np.ndarray:
+    """Gram-Schmidt decode (Zhou et al.). (6,) -> (3, 3)."""
+    a1, a2 = d6[:3], d6[3:]
+    b1 = a1 / (np.linalg.norm(a1) + 1e-8)
+    a2_proj = a2 - np.dot(b1, a2) * b1
+    b2 = a2_proj / (np.linalg.norm(a2_proj) + 1e-8)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=-1)
+
+
+def _matrix_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> quaternion (x, y, z, w). Shepperd's method."""
+    m = R
+    t = m[0, 0] + m[1, 1] + m[2, 2]
+    if t > 0.0:
+        s = np.sqrt(t + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (m[2, 1] - m[1, 2]) / s
+        qy = (m[0, 2] - m[2, 0]) / s
+        qz = (m[1, 0] - m[0, 1]) / s
+    elif (m[0, 0] > m[1, 1]) and (m[0, 0] > m[2, 2]):
+        s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        qw = (m[2, 1] - m[1, 2]) / s
+        qx = 0.25 * s
+        qy = (m[0, 1] + m[1, 0]) / s
+        qz = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        qw = (m[0, 2] - m[2, 0]) / s
+        qx = (m[0, 1] + m[1, 0]) / s
+        qy = 0.25 * s
+        qz = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        qw = (m[1, 0] - m[0, 1]) / s
+        qx = (m[0, 2] + m[2, 0]) / s
+        qy = (m[1, 2] + m[2, 1]) / s
+        qz = 0.25 * s
+    return np.array([qx, qy, qz, qw], dtype=np.float64)
 
 
 class RunACT(Policy):
@@ -57,8 +94,8 @@ class RunACT(Policy):
         policy_path = Path(os.environ.get(
             "AIC_ACT_MODEL_PATH",
             # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
-            # "/home/fuheng/ws_aic/src/aic/outputs/train/cheatcode-nic-30/checkpoints/100000/pretrained_model",
-            "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v6/checkpoints/040000/pretrained_model",
+            # "/home/sai/.cache/huggingface/lerobot/checkpoints/080000/pretrained_model",
+            "/home/sai/.cache/huggingface/lerobot/models/outputs/train/nic_card_mount_0_merged_trimmed_rot6d_slim/checkpoints/020000/pretrained_model"
         ))
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
@@ -115,13 +152,11 @@ class RunACT(Policy):
         }
         print(f"Image stats: {self.img_stats}")
 
-        # Robot State Stats (1, 26)
         self.state_mean = get_obs_stat("observation.state.mean", (1, -1))
         self.state_std = get_obs_stat("observation.state.std", (1, -1))
         print(f"Robot state mean: {self.state_mean}")
         print(f"Robot state std: {self.state_std}")
 
-        # Action Stats (1, 6) - Used for Un-normalization
         self.action_mean = get_action_stat("action.mean", (1, -1))
         self.action_std = get_action_stat("action.std", (1, -1))
         print(f"Action mean: {self.action_mean}")
@@ -195,25 +230,8 @@ class RunACT(Policy):
         }
 
         # --- Process Robot State ---
-        # 32-dim state matching the training adapter (see aic_robot_aic_controller.py).
-        tcp_pose = obs_msg.controller_state.tcp_pose
+        # Slim 12-dim state: tcp_velocity (linear+angular) + tared wrench (force+torque).
         tcp_vel = obs_msg.controller_state.tcp_velocity
-
-        # obs_msg.joint_states.position is in CONTROLLER order from aic_adapter:
-        # [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3, gripper]
-        # But the dataset was recorded from raw /joint_states topic in ALPHABETICAL order:
-        # [elbow, gripper, shoulder_lift, shoulder_pan, wrist_1, wrist_2, wrist_3]
-        # Reorder to match training data.
-        ctrl = obs_msg.joint_states.position
-        joints_alpha = [
-            ctrl[2],  # elbow
-            ctrl[6],  # gripper
-            ctrl[1],  # shoulder_lift
-            ctrl[0],  # shoulder_pan
-            ctrl[3],  # wrist_1
-            ctrl[4],  # wrist_2
-            ctrl[5],  # wrist_3
-        ]
 
         # /fts_broadcaster/wrench is RAW (pre-tare). Training data subtracts
         # controller_state.fts_tare_offset; mirror that here so inference state
@@ -223,28 +241,12 @@ class RunACT(Policy):
 
         state_np = np.array(
             [
-                # TCP Position (3)
-                tcp_pose.position.x,
-                tcp_pose.position.y,
-                tcp_pose.position.z,
-                # TCP Orientation (4)
-                tcp_pose.orientation.x,
-                tcp_pose.orientation.y,
-                tcp_pose.orientation.z,
-                tcp_pose.orientation.w,
-                # TCP Linear Vel (3)
                 tcp_vel.linear.x,
                 tcp_vel.linear.y,
                 tcp_vel.linear.z,
-                # TCP Angular Vel (3)
                 tcp_vel.angular.x,
                 tcp_vel.angular.y,
                 tcp_vel.angular.z,
-                # TCP Error (6)
-                *obs_msg.controller_state.tcp_error,
-                # Joint Positions (7) in alphabetical order to match training
-                *joints_alpha,
-                # Tared wrench (6): force xyz, torque xyz
                 raw_w.force.x - tare_w.force.x,
                 raw_w.force.y - tare_w.force.y,
                 raw_w.force.z - tare_w.force.z,
@@ -273,12 +275,9 @@ class RunACT(Policy):
     ):
         self.policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
-        # Note: aic_model.handle_joint_motion_update auto-switches controller to JOINT mode
-        # on the first joint_motion_update call, so no manual mode switch is needed.
 
         start_time = time.time()
 
-        # Run inference for 30 seconds
         while time.time() - start_time < 120.0:
             loop_start = time.time()
 
@@ -293,33 +292,29 @@ class RunACT(Policy):
 
             # 2. Model Inference
             with torch.inference_mode():
-                # returns shape [1, 7] (first action of chunk) - 7 joint positions
+                # shape [1, 9]: [px, py, pz, rot6d.0..5]
                 normalized_action = self.policy.select_action(obs_tensors)
 
             # 3. Un-normalize Action
-            # Formula: (norm * std) + mean
             raw_action_tensor = (normalized_action * self.action_std) + self.action_mean
-
-            # 4. Extract joint positions
-            # raw_action_tensor is [1, 7] in alphabetical joint order:
-            # [elbow, gripper/left_finger, shoulder_lift, shoulder_pan, wrist_1, wrist_2, wrist_3]
             action = raw_action_tensor[0].cpu().numpy()
 
-            self.get_logger().info(f"Joint target (alpha order): {action}")
+            # 4. Decode Cartesian pose: [px,py,pz, rot6d] -> (position, quaternion)
+            pos = action[:3].astype(np.float64)
+            R = _rot6d_to_matrix(action[3:9].astype(np.float64))
+            qx, qy, qz, qw = _matrix_to_quat_xyzw(R)
 
-            # Reorder to controller order: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
-            # (drop gripper joint at index 1)
-            controller_positions = [
-                float(action[3]),  # shoulder_pan
-                float(action[2]),  # shoulder_lift
-                float(action[0]),  # elbow
-                float(action[4]),  # wrist_1
-                float(action[5]),  # wrist_2
-                float(action[6]),  # wrist_3
-            ]
+            self.get_logger().info(
+                f"TCP target: pos={pos.tolist()}  quat(xyzw)=[{qx:.4f},{qy:.4f},{qz:.4f},{qw:.4f}]"
+            )
 
-            joint_motion_update = self.make_joint_motion_update(controller_positions)
-            move_robot(joint_motion_update=joint_motion_update)
+            pose = Pose(
+                position=Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2])),
+                orientation=Quaternion(
+                    x=float(qx), y=float(qy), z=float(qz), w=float(qw)
+                ),
+            )
+            self.set_pose_target(move_robot, pose, frame_id="base_link")
             send_feedback("in progress...")
 
             # Maintain control rate to match training data (30Hz loop = 33ms sleep)
@@ -328,18 +323,3 @@ class RunACT(Policy):
 
         self.get_logger().info("RunACT.insert_cable() exiting...")
         return True
-
-    def make_joint_motion_update(self, positions: List[float]) -> JointMotionUpdate:
-        msg = JointMotionUpdate()
-
-        target_state = JointTrajectoryPoint()
-        target_state.positions = positions
-        target_state.velocities = [0.0] * len(positions)
-        msg.target_state = target_state
-
-        msg.target_stiffness = [85.0, 85.0, 85.0, 85.0, 85.0, 85.0]
-        msg.target_damping = [75.0, 75.0, 75.0, 75.0, 75.0, 75.0]
-
-        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_POSITION
-
-        return msg
