@@ -14,6 +14,9 @@ log/
 .pixi/*
 !.pixi/config.toml
 
+# claude code project state
+.claude/
+
 # Ignore mesh/texture assets in aic_mujoco mjcf, keep only .xml
 aic_utils/aic_mujoco/mjcf/*.obj
 aic_utils/aic_mujoco/mjcf/*.stl
