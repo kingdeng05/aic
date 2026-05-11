@@ -165,7 +165,22 @@ class RunACT(Policy):
         # Config
         self.image_scaling = 0.25  # Must match AICRobotAICControllerConfig
 
+        # Ablation: when AIC_ACT_BLANK_IMAGES=1, feed black frames to all cameras to
+        # test whether the policy is relying on visual cues vs. proprioceptive state.
+        self.blank_images = os.environ.get("AIC_ACT_BLANK_IMAGES", "") == "1"
+        if self.blank_images:
+            self.get_logger().warning(
+                "AIC_ACT_BLANK_IMAGES=1 — feeding zero (black) images to the policy."
+            )
+
         self.get_logger().info("Normalization statistics loaded successfully.")
+
+    def _blank_image_tensor(
+        self, mean: torch.Tensor, std: torch.Tensor
+    ) -> torch.Tensor:
+        """Normalized zero (black) image tensor at the model's expected shape."""
+        zeros = torch.zeros(1, 3, 256, 288, device=self.device)
+        return (zeros - mean) / std
 
     @staticmethod
     def _img_to_tensor(
@@ -205,29 +220,42 @@ class RunACT(Policy):
         """Convert ROS Observation message into dictionary of normalized tensors."""
 
         # --- Process Cameras ---
-        obs = {
-            "observation.images.left_camera": self._img_to_tensor(
-                obs_msg.left_image,
-                self.device,
-                self.image_scaling,
-                self.img_stats["left"]["mean"],
-                self.img_stats["left"]["std"],
-            ),
-            "observation.images.center_camera": self._img_to_tensor(
-                obs_msg.center_image,
-                self.device,
-                self.image_scaling,
-                self.img_stats["center"]["mean"],
-                self.img_stats["center"]["std"],
-            ),
-            "observation.images.right_camera": self._img_to_tensor(
-                obs_msg.right_image,
-                self.device,
-                self.image_scaling,
-                self.img_stats["right"]["mean"],
-                self.img_stats["right"]["std"],
-            ),
-        }
+        if self.blank_images:
+            obs = {
+                "observation.images.left_camera": self._blank_image_tensor(
+                    self.img_stats["left"]["mean"], self.img_stats["left"]["std"]
+                ),
+                "observation.images.center_camera": self._blank_image_tensor(
+                    self.img_stats["center"]["mean"], self.img_stats["center"]["std"]
+                ),
+                "observation.images.right_camera": self._blank_image_tensor(
+                    self.img_stats["right"]["mean"], self.img_stats["right"]["std"]
+                ),
+            }
+        else:
+            obs = {
+                "observation.images.left_camera": self._img_to_tensor(
+                    obs_msg.left_image,
+                    self.device,
+                    self.image_scaling,
+                    self.img_stats["left"]["mean"],
+                    self.img_stats["left"]["std"],
+                ),
+                "observation.images.center_camera": self._img_to_tensor(
+                    obs_msg.center_image,
+                    self.device,
+                    self.image_scaling,
+                    self.img_stats["center"]["mean"],
+                    self.img_stats["center"]["std"],
+                ),
+                "observation.images.right_camera": self._img_to_tensor(
+                    obs_msg.right_image,
+                    self.device,
+                    self.image_scaling,
+                    self.img_stats["right"]["mean"],
+                    self.img_stats["right"]["std"],
+                ),
+            }
 
         # --- Process Robot State ---
         # Slim 12-dim state: tcp_velocity (linear+angular) + tared wrench (force+torque).
