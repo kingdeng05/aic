@@ -12,6 +12,7 @@ log/
 
 # pixi environments
 .pixi/*
+pixi.lock
 !.pixi/config.toml
 
 # claude code project state
