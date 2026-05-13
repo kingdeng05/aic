@@ -17,10 +17,12 @@ exhibit teleop-style overshoot-and-correct behavior.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import Any, cast
 
+import numpy as np
 import rclpy
 from geometry_msgs.msg import Transform
 from lerobot.teleoperators import Teleoperator, TeleoperatorConfig
@@ -29,6 +31,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformException, TransformListener
+from transforms3d.quaternions import quat2mat
 
 from .cheatcode_perturbation import OUPerturbation, PerturbationConfig
 from .cheatcode_trajectory import (
@@ -48,11 +51,39 @@ class CheatCodeTeleopConfig(TeleoperatorConfig):
     target_module_name: str = "task_board"
     port_name: str = "ethernet_port0"
 
-    # Trajectory shape (mirrors CheatCode.insert_cable).
-    approach_ticks: int = 100  # ~5 s at 20 Hz
+    # Trajectory shape.
+    #
+    # Approach is split into two sub-phases so the gripper translates above
+    # the port FIRST (keeping the existing orientation, so wrist cameras can
+    # see the port come into frame) and then rotates to port-aligned without
+    # changing position. approach_translate_ticks + approach_rotate_ticks
+    # replaces the legacy single "approach_ticks" parameter; setting either
+    # to 0 disables that sub-phase.
+    approach_translate_ticks: int = 60
+    approach_rotate_ticks: int = 40
     approach_z_offset_m: float = 0.2
-    descend_step_m: float = 0.0005
-    descend_final_z_offset_m: float = -0.015
+    descend_step_m: float = 0.00025  # slower than legacy 0.0005 for SC port
+    # Floor is intentionally very deep: the open-loop tick ramp will keep
+    # commanding deeper than physically reachable until the success predicate
+    # (port-local-z) fires or the episode times out. The ramp itself is not
+    # the terminal signal anymore — _check_success is.
+    descend_final_z_offset_m: float = -1.0
+
+    # Lift-and-adjust: if the plug stops moving in z while we keep commanding
+    # descent, we presume contact and the plug is hung up on the port lip.
+    # Lift the gripper back up by `lift_amount_m`, reset the XY integrator,
+    # and descend again. Capped at `max_lift_retries`.
+    stuck_threshold_ticks: int = 30   # ~1 s at 30 Hz
+    plug_stuck_eps_m: float = 1e-4    # <0.1 mm/tick of plug.z motion
+    lift_amount_m: float = 0.025      # 2.5 cm — visible and large enough to clear lip
+    lift_step_m: float = 0.001        # 4x descend_step_m so lift completes in ~250 ms
+    max_lift_retries: int = 10
+    # Pre-bias the XY integrator with a small random offset on each lift
+    # completion. Without this, the integrator resets to (0,0) and re-converges
+    # to the *same* wedge angle each retry, leading to a "lift -> same wedge"
+    # cycle. With it, each retry approaches the port from a slightly different
+    # azimuth, breaking out of repeated wedges. Set 0 to disable.
+    lift_xy_jitter_m: float = 0.004
 
     # Perturbation.
     approach_noise_xyz_m: float = 0.004
@@ -61,9 +92,17 @@ class CheatCodeTeleopConfig(TeleoperatorConfig):
     ou_theta: float = 0.05
     noise_seed: int | None = None
 
-    # Success predicate.
+    # Success predicate. Evaluated in the port's *local* frame so it's well
+    # defined for ports whose insertion axis isn't aligned with world axes.
+    # SDF convention: port +Z is the insertion direction, entrance is at
+    # -entrance_depth, port frame origin is inside the receptacle. We declare
+    # success when the plug has reached port-local Z = 0 (within
+    # success_z_tol_m on the entrance side) AND off-axis drift is within
+    # success_xy_tol_m. With this predicate, the open-loop descent floor at
+    # descend_final_z_offset_m no longer acts as a terminal signal — only
+    # actual plug geometry does.
     success_xy_tol_m: float = 0.002
-    success_z_tol_m: float = 0.001
+    success_z_tol_m: float = 0.005
     success_hold_ticks: int = 10
 
     # TF wait timeout on connect().
@@ -105,9 +144,22 @@ class CheatCodeTeleop(Teleoperator):
 
         self._tick: int = 0
         self._z_offset: float = config.approach_z_offset_m
-        self._phase: str = "approach"  # approach | descend | hold
+        # Phases: translate (move above port keeping orientation),
+        # rotate (slerp orientation to port-aligned in place),
+        # descend (step Z down to descend_final_z_offset_m),
+        # lifting (back off Z after stuck-on-port detected),
+        # hold (terminal — geometric success predicate satisfied).
+        self._phase: str = "translate"
         self._success_streak: int = 0
         self._last_action: PoseTargetActionDict | None = None
+        # Lift-and-adjust bookkeeping.
+        self._stuck_ticks: int = 0
+        self._last_plug_z: float | None = None
+        self._lift_target_z_offset: float = config.approach_z_offset_m
+        self._lift_retries: int = 0
+        # Separate RNG for lift-retry jitter so it isn't entangled with the
+        # OU perturbation seed semantics.
+        self._lift_rng = random.Random(config.noise_seed)
 
     # --- Teleoperator API -------------------------------------------------
 
@@ -204,11 +256,15 @@ class CheatCodeTeleop(Teleoperator):
     def _reset_episode_state(self) -> None:
         self._tick = 0
         self._z_offset = self.config.approach_z_offset_m
-        self._phase = "approach"
+        self._phase = "translate"
         self._success_streak = 0
         self._integrator.reset()
         self._perturbation.reset()
         self._last_action = None
+        self._stuck_ticks = 0
+        self._last_plug_z = None
+        self._lift_target_z_offset = self.config.approach_z_offset_m
+        self._lift_retries = 0
 
     def reset(self) -> None:
         """Called by the record wrapper between episodes to clear OU bias,
@@ -262,25 +318,92 @@ class CheatCodeTeleop(Teleoperator):
     def _advance_schedule(self) -> tuple[float, float, float, bool]:
         """Return (slerp_fraction, position_fraction, z_offset, reset_integrator)
         for the current tick, and advance state.
+
+        Phase machine:
+          translate -> rotate -> descend -> [lifting -> descend ...] -> hold
+
+        translate: position_fraction ramps 0->1 while slerp_fraction stays 0
+                   so the gripper moves to "above port" with its current
+                   orientation (wrist cameras see the port appear in view).
+        rotate:    position_fraction held at 1, slerp_fraction ramps 0->1
+                   so the gripper rotates to port-aligned in place.
+        descend:   step z_offset down by descend_step_m each tick, with the
+                   integrator active so XY drifts toward the port.
+        lifting:   step z_offset UP by descend_step_m each tick until
+                   _lift_target_z_offset is reached, then return to descend
+                   with a freshly-reset integrator. Triggered by
+                   _maybe_trigger_lift() when plug.z stops moving but we are
+                   still commanding descent.
+        hold:      terminal — descend converged within geometric tolerance.
         """
-        if self._phase == "approach":
-            f = min(1.0, (self._tick + 1) / max(1, self.config.approach_ticks))
-            slerp_fraction = f
-            position_fraction = f
+        translate_n = max(0, self.config.approach_translate_ticks)
+        rotate_n = max(0, self.config.approach_rotate_ticks)
+
+        if self._phase == "translate":
+            denom = max(1, translate_n)
+            position_fraction = min(1.0, (self._tick + 1) / denom)
+            slerp_fraction = 0.0
             z_offset = self.config.approach_z_offset_m
             reset_integrator = True
-            if self._tick + 1 >= self.config.approach_ticks:
+            if self._tick + 1 >= translate_n:
+                self._phase = "rotate" if rotate_n > 0 else "descend"
+                # Restart sub-phase counter for the rotate phase.
+                self._tick = -1  # will be incremented at end of get_action
+        elif self._phase == "rotate":
+            denom = max(1, rotate_n)
+            slerp_fraction = min(1.0, (self._tick + 1) / denom)
+            position_fraction = 1.0
+            z_offset = self.config.approach_z_offset_m
+            reset_integrator = True
+            if self._tick + 1 >= rotate_n:
                 self._phase = "descend"
+                self._tick = -1
         elif self._phase == "descend":
             slerp_fraction = 1.0
             position_fraction = 1.0
-            # Step z_offset down each tick; don't go below the final value.
             self._z_offset = max(
                 self.config.descend_final_z_offset_m,
                 self._z_offset - self.config.descend_step_m,
             )
             z_offset = self._z_offset
             reset_integrator = False
+        elif self._phase == "lifting":
+            slerp_fraction = 1.0
+            position_fraction = 1.0
+            # Step z_offset back UP to the lift target at lift_step_m/tick.
+            self._z_offset = min(
+                self._lift_target_z_offset,
+                self._z_offset + self.config.lift_step_m,
+            )
+            z_offset = self._z_offset
+            # Hold integrator fixed while lifting; XY isn't trying to track.
+            reset_integrator = False
+            if self._z_offset >= self._lift_target_z_offset - 1e-6:
+                # Lifted enough; reset XY integrator (optionally with a small
+                # random pre-bias so the next descent doesn't drive the plug
+                # to the same wedge point), then try descending again.
+                jitter = self.config.lift_xy_jitter_m
+                if jitter > 0.0:
+                    i_gain = max(self.config.integrator_i_gain, 1e-6)
+                    # Map desired metric XY bias back to integrator state.
+                    jx_m = (self._lift_rng.random() * 2.0 - 1.0) * jitter
+                    jy_m = (self._lift_rng.random() * 2.0 - 1.0) * jitter
+                    self._integrator.x = jx_m / i_gain
+                    self._integrator.y = jy_m / i_gain
+                else:
+                    jx_m = 0.0
+                    jy_m = 0.0
+                    self._integrator.reset()
+                self._stuck_ticks = 0
+                self._last_plug_z = None
+                self._phase = "descend"
+                if self._node is not None:
+                    self._node.get_logger().info(
+                        f"CheatCodeTeleop: lift complete at z_offset="
+                        f"{self._z_offset:+.4f}, resuming descend "
+                        f"(integrator pre-bias: x={jx_m * 1000:+.2f}mm, "
+                        f"y={jy_m * 1000:+.2f}mm)"
+                    )
         else:  # hold
             slerp_fraction = 1.0
             position_fraction = 1.0
@@ -288,15 +411,118 @@ class CheatCodeTeleop(Teleoperator):
             reset_integrator = False
         return slerp_fraction, position_fraction, z_offset, reset_integrator
 
+    def _maybe_trigger_lift(self, plug_z: float) -> None:
+        """If we're descending and the plug has stopped moving in z while we
+        keep commanding it down, presume the plug hit the port lip and lift
+        back up to retry. No-op while not in 'descend' phase. After
+        max_lift_retries, just give up and let descend run to its terminal.
+        """
+        if self._phase != "descend":
+            return
+        if self._lift_retries >= self.config.max_lift_retries:
+            return
+        # Need at least one previous sample to detect "no motion".
+        if self._last_plug_z is None:
+            self._last_plug_z = plug_z
+            return
+        if abs(plug_z - self._last_plug_z) < self.config.plug_stuck_eps_m:
+            self._stuck_ticks += 1
+        else:
+            self._stuck_ticks = 0
+        self._last_plug_z = plug_z
+        if self._stuck_ticks >= self.config.stuck_threshold_ticks:
+            self._lift_target_z_offset = self._z_offset + self.config.lift_amount_m
+            self._lift_retries += 1
+            self._phase = "lifting"
+            if self._node is not None:
+                # Look up plug port-local z + gripper TCP for diagnostics so
+                # we can tell from the log alone whether the gripper actually
+                # moves when lift fires (GUI delta of 8mm was invisible).
+                extras = ""
+                try:
+                    assert self._port_transform is not None
+                    assert self._tf_buffer is not None
+                    q_port = (
+                        self._port_transform.rotation.w,
+                        self._port_transform.rotation.x,
+                        self._port_transform.rotation.y,
+                        self._port_transform.rotation.z,
+                    )
+                    R_port = quat2mat(np.array(q_port))
+                    port_pos = np.array(
+                        [
+                            self._port_transform.translation.x,
+                            self._port_transform.translation.y,
+                            self._port_transform.translation.z,
+                        ]
+                    )
+                    plug_tf = self._tf_buffer.lookup_transform(
+                        "base_link",
+                        f"{self.config.cable_name}/{self.config.plug_name}_link",
+                        Time(),
+                    )
+                    plug_pos = np.array(
+                        [
+                            plug_tf.transform.translation.x,
+                            plug_tf.transform.translation.y,
+                            plug_tf.transform.translation.z,
+                        ]
+                    )
+                    plug_pl = R_port.T @ (plug_pos - port_pos)
+                    tcp_tf = self._tf_buffer.lookup_transform(
+                        "base_link", "gripper/tcp", Time()
+                    )
+                    tcp = (
+                        tcp_tf.transform.translation.x,
+                        tcp_tf.transform.translation.y,
+                        tcp_tf.transform.translation.z,
+                    )
+                    extras = (
+                        f" | plug_port_local=({plug_pl[0]:+.4f},"
+                        f"{plug_pl[1]:+.4f},{plug_pl[2]:+.4f}) "
+                        f"tcp_world=({tcp[0]:+.4f},{tcp[1]:+.4f},{tcp[2]:+.4f})"
+                    )
+                except (TransformException, AssertionError):
+                    pass
+                self._node.get_logger().info(
+                    f"CheatCodeTeleop: plug stuck (z={plug_z:+.4f}), "
+                    f"lifting to z_offset={self._lift_target_z_offset:+.4f} "
+                    f"(retry {self._lift_retries}/{self.config.max_lift_retries})"
+                    f"{extras}"
+                )
+
     def _check_success(self, plug_xyz: tuple[float, float, float]) -> None:
         assert self._port_transform is not None
-        dx = plug_xyz[0] - self._port_transform.translation.x
-        dy = plug_xyz[1] - self._port_transform.translation.y
-        dist_xy = math.hypot(dx, dy)
-        dist_z = abs(plug_xyz[2] - self._port_transform.translation.z)
+        # Express plug in port-local frame. SDF convention: port +Z is the
+        # insertion direction, entrance is at port_local_z = -entrance_depth.
+        # The plug is "inserted" when its tip reaches the port frame origin
+        # (within success_z_tol_m on the entrance side) AND off-axis drift is
+        # within success_xy_tol_m. World-frame XYZ tolerance (the old
+        # predicate) couldn't fire for ports whose +Z isn't world +Z, because
+        # the gripper-vs-plug rigid offset moves the plug below the port-z in
+        # world frame even at full insertion.
+        q_port = (
+            self._port_transform.rotation.w,
+            self._port_transform.rotation.x,
+            self._port_transform.rotation.y,
+            self._port_transform.rotation.z,
+        )
+        R_port = quat2mat(np.array(q_port))
+        port_pos = np.array(
+            [
+                self._port_transform.translation.x,
+                self._port_transform.translation.y,
+                self._port_transform.translation.z,
+            ]
+        )
+        plug_in_port_local = R_port.T @ (np.array(plug_xyz) - port_pos)
+        dist_xy = math.hypot(
+            float(plug_in_port_local[0]), float(plug_in_port_local[1])
+        )
+        plug_port_local_z = float(plug_in_port_local[2])
         if (
             dist_xy < self.config.success_xy_tol_m
-            and dist_z < self.config.success_z_tol_m
+            and plug_port_local_z >= -self.config.success_z_tol_m
         ):
             self._success_streak += 1
         else:
@@ -308,12 +534,23 @@ class CheatCodeTeleop(Teleoperator):
             self._phase = "hold"
             if self._node is not None:
                 self._node.get_logger().info(
-                    "CheatCodeTeleop: insertion success, entering HOLD"
+                    "CheatCodeTeleop: insertion success "
+                    f"(port_local_z={plug_port_local_z:+.4f}m, "
+                    f"xy={dist_xy * 1000:.2f}mm), entering HOLD"
                 )
 
     def get_action(self) -> dict[str, Any]:
         if not self._is_connected or self._tf_buffer is None or self._port_transform is None:
             raise DeviceNotConnectedError()
+
+        # Once HOLD has fired (insertion success), park the action. Otherwise
+        # the integrator and OU perturbation keep accumulating during the
+        # post-success tail and the recorded xy drifts ~1cm over the episode
+        # remainder. Returning the last action keeps the plateau clean so the
+        # downstream trim script chops on a true plateau.
+        if self._phase == "hold" and self._last_action is not None:
+            self._tick += 1
+            return cast(dict, self._last_action)
 
         slerp_fraction, position_fraction, z_offset, reset_integrator = (
             self._advance_schedule()
@@ -354,11 +591,14 @@ class CheatCodeTeleop(Teleoperator):
             )
 
         self._check_success(plug_xyz)
+        self._maybe_trigger_lift(plug_xyz[2])
 
         # Apply perturbation to the commanded pose (does NOT affect the true
         # plug/port TFs used for PI correction — the next tick will pull us
         # back, producing overshoot-and-correct).
-        phase_for_noise = "approach" if self._phase == "approach" else "descend"
+        phase_for_noise = (
+            "approach" if self._phase in ("translate", "rotate") else "descend"
+        )
         px, py, pz = self._perturbation.perturb_xyz(
             (pose.position.x, pose.position.y, pose.position.z), phase_for_noise
         )

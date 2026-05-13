@@ -95,7 +95,8 @@ class RunACT(Policy):
             "AIC_ACT_MODEL_PATH",
             # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
             # "/home/sai/.cache/huggingface/lerobot/checkpoints/080000/pretrained_model",
-            "/home/sai/.cache/huggingface/lerobot/models/outputs/train/nic_card_mount_0_merged_trimmed_rot6d_slim/checkpoints/020000/pretrained_model"
+            # "/home/sai/.cache/huggingface/lerobot/models/outputs/train/nic_card_mount_0_merged_trimmed_rot6d_slim/checkpoints/020000/pretrained_model"
+            "/home/fuheng/ws_aic/src/aic/outputs/train/sc_port0-rand-cart6d-cs-25/checkpoints/080000/pretrained_model"
         ))
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
@@ -306,7 +307,7 @@ class RunACT(Policy):
 
         start_time = time.time()
 
-        while time.time() - start_time < 120.0:
+        while time.time() - start_time < 180.0:
             loop_start = time.time()
 
             # 1. Get & Process Observation

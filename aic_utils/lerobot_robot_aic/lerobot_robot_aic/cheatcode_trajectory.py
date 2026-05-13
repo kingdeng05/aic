@@ -20,6 +20,7 @@ from geometry_msgs.msg import Point, Pose, Quaternion, Transform
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformException
 from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
+from transforms3d.quaternions import quat2mat
 
 
 @dataclass
@@ -120,30 +121,70 @@ def calc_gripper_pose(
         gripper_tf.transform.translation.y,
         gripper_tf.transform.translation.z,
     )
-    port_xy = (port_transform.translation.x, port_transform.translation.y)
     plug_xyz = (
         plug_tf.transform.translation.x,
         plug_tf.transform.translation.y,
         plug_tf.transform.translation.z,
     )
-    plug_tip_gripper_offset_z = gripper_xyz[2] - plug_xyz[2]
 
-    tip_x_error = port_xy[0] - plug_xyz[0]
-    tip_y_error = port_xy[1] - plug_xyz[1]
+    # Position control: descend along the port's *local* Z (the insertion
+    # axis), not base_link Z. Otherwise ports whose insertion axis is not
+    # aligned with world -Z (e.g. the SC port, whose Z points along world +X
+    # given task_board_yaw=π + per-port RPY of (π/2,0,π/2)) get pushed
+    # perpendicular to their entrance and the plug never enters.
+    R_port = quat2mat(np.array(q_port))   # 3x3, columns = port axes in world
+    R_plug = quat2mat(np.array(q_plug))
 
+    port_pos = np.array(
+        [
+            port_transform.translation.x,
+            port_transform.translation.y,
+            port_transform.translation.z,
+        ]
+    )
+    plug_pos = np.array(plug_xyz)
+    gripper_pos = np.array(gripper_xyz)
+
+    # Plug position expressed in port-local frame; off-axis drift is the
+    # plug's X/Y in this frame. Integrator accumulates that off-axis error
+    # so we apply correction perpendicular to the insertion direction.
+    plug_in_port_local = R_port.T @ (plug_pos - port_pos)
+    err_x = -float(plug_in_port_local[0])
+    err_y = -float(plug_in_port_local[1])
     if reset_xy_integrator:
         integrator.reset()
     else:
-        integrator.step(tip_x_error, tip_y_error)
+        integrator.step(err_x, err_y)
 
-    target_x = port_xy[0] + i_gain * integrator.x
-    target_y = port_xy[1] + i_gain * integrator.y
-    target_z = port_transform.translation.z + z_offset - plug_tip_gripper_offset_z
+    # Desired plug-tip position in world: z_offset along port-local *-Z*,
+    # plus the integrator's correction in port-local X/Y. The minus sign
+    # reflects the SDF convention used by every port in this repo: the port
+    # frame's +Z is the insertion direction (entrance link is at
+    # port_local_z = -entrance_depth), so the *approach* pose is on the
+    # negative-Z side of the port frame and "deeper into the port" means
+    # negative z_offset. With this convention:
+    #   approach_z_offset_m = +0.2   -> 20 cm "above" the port (approach)
+    #   descend_final_z_offset_m = -0.015 -> 1.5 cm past the port frame.
+    plug_target_local = np.array(
+        [i_gain * integrator.x, i_gain * integrator.y, -z_offset]
+    )
+    plug_target_world = port_pos + R_port @ plug_target_local
+
+    # Gripper-to-plug offset is rigid in the plug's frame (cable is welded
+    # to the gripper). As the gripper slerps toward port-aligned, the plug
+    # follows, so the world-frame offset rotates accordingly.
+    plug_to_gripper_local = R_plug.T @ (gripper_pos - plug_pos)
+    q_plug_slerp = np.array(quaternion_slerp(q_plug, q_port, slerp_fraction))
+    R_plug_slerp = quat2mat(q_plug_slerp)
+    gripper_target_world = plug_target_world + R_plug_slerp @ plug_to_gripper_local
 
     blend_xyz = (
-        position_fraction * target_x + (1.0 - position_fraction) * gripper_xyz[0],
-        position_fraction * target_y + (1.0 - position_fraction) * gripper_xyz[1],
-        position_fraction * target_z + (1.0 - position_fraction) * gripper_xyz[2],
+        position_fraction * float(gripper_target_world[0])
+        + (1.0 - position_fraction) * gripper_xyz[0],
+        position_fraction * float(gripper_target_world[1])
+        + (1.0 - position_fraction) * gripper_xyz[1],
+        position_fraction * float(gripper_target_world[2])
+        + (1.0 - position_fraction) * gripper_xyz[2],
     )
 
     pose = Pose(

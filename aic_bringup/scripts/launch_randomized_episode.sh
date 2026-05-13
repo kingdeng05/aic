@@ -24,13 +24,14 @@
 set -euo pipefail
 
 TARGET=""
-CABLE_TYPE="sfp_sc_cable"
+CABLE_TYPE=""
 EPISODE_TIME_S=600
 DATASET_PREFIX="cheatcode"
 SEED=$RANDOM
 RANDOMIZE=1
 RANDOM_HOME_OFFSET="0.06"
 DRY_RUN=0
+HEADLESS=0
 LAUNCH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -42,6 +43,7 @@ while [[ $# -gt 0 ]]; do
         --seed=*)               SEED="${1#*=}";                shift ;;
         --random-home-offset=*) RANDOM_HOME_OFFSET="${1#*=}";  shift ;;
         --no-randomize)         RANDOMIZE=0;                   shift ;;
+        --headless)             HEADLESS=1;                    shift ;;
         --dry-run)              DRY_RUN=1;                     shift ;;
         --)                     shift; LAUNCH_ARGS+=("$@"); break ;;
         *:=*)                   LAUNCH_ARGS+=("$1");           shift ;;
@@ -59,7 +61,7 @@ rng = random.Random(seed)
 # Sampling ranges from docs/task_board_description.md.
 RANGES = {
     "nic_card_mount":  {"translation": (-0.0215, 0.0234), "yaw": (-0.1745, 0.1745)},
-    "sc_port":         {"translation": (-0.06,   0.055)},
+    "sc_port":         {"translation": (0.05, 0.05)},      # HARDCODED 5cm for cheatcode test (was: (-0.06, 0.055))
     "lc_mount_rail":   {"translation": (-0.09425, 0.09425), "yaw": (-1.047, 1.047)},
     "sfp_mount_rail":  {"translation": (-0.09425, 0.09425), "yaw": (-1.047, 1.047)},
     "sc_mount_rail":   {"translation": (-0.09425, 0.09425), "yaw": (-1.047, 1.047)},
@@ -142,6 +144,45 @@ fi
 TS=$(date +%s)
 REPO_ID="local/${DATASET_PREFIX}-${TS}"
 
+# Derive target-type-specific defaults from TARGET. nic_card_mount_* slots are
+# SFP insertions; sc_port_* slots are SC insertions. The frame names come from
+# the SDF models (NIC Card Mount has sfp_port_{0,1}_link, SC Port has
+# sc_port_link with macro namespace prefix; the AIC engine config uses
+# port_name=sc_port_base for SC). cable_type matches the relevant plug being
+# held in the gripper at spawn time.
+PLUG_NAME=""
+PORT_NAME=""
+SINGLE_TASK=""
+case "${TARGET:-}" in
+    nic_card_mount_*)
+        PLUG_NAME="sfp_tip"
+        PORT_NAME="sfp_port_0"
+        SINGLE_TASK="Insert SFP SC cable into NIC card port"
+        [[ -z "$CABLE_TYPE" ]] && CABLE_TYPE="sfp_sc_cable"
+        ;;
+    sc_port_*)
+        PLUG_NAME="sc_tip"
+        PORT_NAME="sc_port_base"
+        SINGLE_TASK="Insert SC cable into SC port"
+        [[ -z "$CABLE_TYPE" ]] && CABLE_TYPE="sfp_sc_cable_reversed"
+        ;;
+    "")
+        # No target detected; leave fields empty — caller is responsible.
+        [[ -z "$CABLE_TYPE" ]] && CABLE_TYPE="sfp_sc_cable"
+        ;;
+    *)
+        echo "[sim] WARNING: unknown target '${TARGET}', falling back to SFP defaults" >&2
+        PLUG_NAME="sfp_tip"
+        PORT_NAME="sfp_port_0"
+        SINGLE_TASK="Insert SFP SC cable into NIC card port"
+        [[ -z "$CABLE_TYPE" ]] && CABLE_TYPE="sfp_sc_cable"
+        ;;
+esac
+
+if [[ $HEADLESS -eq 1 ]]; then
+    LAUNCH_ARGS+=("gazebo_gui:=false" "launch_rviz:=false")
+fi
+
 SCENE_SUMMARY=$(LAUNCH_ARGS_STR="${LAUNCH_ARGS[*]:-}" python3 - <<'PYEOF'
 import math, os, re
 from collections import defaultdict
@@ -185,14 +226,14 @@ ${HOME_OFFSET_SUMMARY}
   pixi run aic-record \\
     --robot.type=aic_controller --robot.id=aic \\
     --teleop.type=cheatcode --teleop.id=aic \\
-    --teleop.cable_name=cable_0 --teleop.plug_name=sfp_tip \\
-    --teleop.target_module_name=${TARGET} --teleop.port_name=sfp_port_0 \\
+    --teleop.cable_name=cable_0 --teleop.plug_name=${PLUG_NAME} \\
+    --teleop.target_module_name=${TARGET} --teleop.port_name=${PORT_NAME} \\
     --teleop.approach_noise_xyz_m=0 \\
     --teleop.descent_noise_xyz_m=0 \\
     --teleop.approach_rot_noise_deg=0 \\
     --robot.teleop_target_mode=pose --robot.teleop_frame_id=gripper/tcp \\
     --dataset.repo_id=${REPO_ID} \\
-    --dataset.single_task="Insert SFP SC cable into NIC card port" \\
+    --dataset.single_task="${SINGLE_TASK}" \\
     --dataset.push_to_hub=false --play_sounds=false --display_data=false \\
     --dataset.num_episodes=1 --dataset.episode_time_s=${EPISODE_TIME_S} --dataset.reset_time_s=0
 EOF
@@ -217,8 +258,26 @@ fi
 # colcon's setup.bash references COLCON_TRACE without a default, which
 # trips `set -u`. Relax nounset for the source + exec tail.
 set +u
-# shellcheck disable=SC1091
-source ~/ws_aic_challenge/install/setup.bash
+# Source the container's /ws_aic/install first so all of the base AIC
+# infrastructure (kilted-targeted, root-owned) is loaded, then overlay
+# $HOME/ws_aic/install on top so any packages the user has rebuilt in their
+# bind-mounted workspace (e.g. aic_bringup with the randomized-home wiring)
+# override the stale /ws_aic copies. AIC_WS_SETUP, if set, replaces the whole
+# search entirely (escape hatch).
+if [[ -n "${AIC_WS_SETUP:-}" && -f "${AIC_WS_SETUP}" ]]; then
+    # shellcheck disable=SC1090
+    source "$AIC_WS_SETUP"
+else
+    for _setup in \
+        "/ws_aic/install/setup.bash" \
+        "$HOME/ws_aic_challenge/install/setup.bash" \
+        "$HOME/ws_aic/install/setup.bash"; do
+        if [[ -f "$_setup" ]]; then
+            # shellcheck disable=SC1090
+            source "$_setup"
+        fi
+    done
+fi
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 ros2 run rmw_zenoh_cpp rmw_zenohd &
 sleep 2

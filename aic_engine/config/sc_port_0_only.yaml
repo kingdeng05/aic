@@ -1,0 +1,153 @@
+# SC-port-0-only eval config.
+#
+# Matches the training data: sc_port_0 on sc_rail_0, sfp_sc_cable_reversed,
+# nothing else present on the board. Use this for eval/policy testing so you
+# don't have to wait through the NIC/SFP trials in sample_config.yaml.
+#
+# Launch with:
+#   ros2 launch aic_bringup aic_gz_bringup.launch.py \
+#       start_aic_engine:=true ground_truth:=false \
+#       aic_engine_config_file:=/ws_aic/install/share/aic_engine/config/sc_port_0_only.yaml
+
+# Scoring + limits are copied verbatim from sample_config.yaml so the
+# engine's scoring topics and trial-validation rules stay identical.
+scoring:
+  topics:
+    - topic:
+        name: "/joint_states"
+        type: "sensor_msgs/msg/JointState"
+    - topic:
+        name: "/tf"
+        type: "tf2_msgs/msg/TFMessage"
+    - topic:
+        name: "/tf_static"
+        type: "tf2_msgs/msg/TFMessage"
+        latched: true
+    - topic:
+        name: "/scoring/tf"
+        type: "tf2_msgs/msg/TFMessage"
+    - topic:
+        name: "/aic/gazebo/contacts/off_limit"
+        type: "ros_gz_interfaces/msg/Contacts"
+    - topic:
+        name: "/fts_broadcaster/wrench"
+        type: "geometry_msgs/msg/WrenchStamped"
+    - topic:
+        name: "/aic_controller/joint_commands"
+        type: "aic_control_interfaces/msg/JointMotionUpdate"
+    - topic:
+        name: "/aic_controller/pose_commands"
+        type: "aic_control_interfaces/msg/MotionUpdate"
+    - topic:
+        name: "/scoring/insertion_event"
+        type: "std_msgs/msg/String"
+    - topic:
+        name: "/aic_controller/controller_state"
+        type: "aic_control_interfaces/msg/ControllerState"
+
+task_board_limits:
+  nic_rail:
+    min_translation: -0.0215
+    max_translation: 0.0234
+  sc_rail:
+    min_translation: -0.06
+    max_translation: 0.055
+  mount_rail:
+    min_translation: -0.09425
+    max_translation: 0.09425
+
+trials:
+  trial_1:
+    scene:
+      task_board:
+        pose:
+          # VERIFIED EMPIRICALLY (2026-05-12): the engine's
+          # /gz_server/spawn_entity interprets the YAML pose with a 180° yaw
+          # offset compared to launch_randomized_episode.sh's
+          # `ros_gz_sim create -Y 0`. With pose.yaw=0 here, the resulting
+          # sc_port_0 ends up at +89.92° yaw in base_link, while training
+          # had it at -90.09°. Setting pose.yaw=π cancels the offset and
+          # makes the eval board pose match training exactly.
+          # Training port (yaw=0 launch):    (-0.4247, +0.4298, +0.0145)  yaw=-90°
+          # Eval at YAML yaw=0:              (-0.3749, +0.1707, +0.0145)  yaw=+90°  WRONG
+          # Eval at YAML yaw=π (expected):   matches training              yaw=-90°
+          x: 0.15
+          y: -0.2
+          z: 1.14
+          roll: 0.0
+          pitch: 0.0
+          yaw: 3.141592653589793
+        nic_rail_0:
+          entity_present: False
+        nic_rail_1:
+          entity_present: False
+        nic_rail_2:
+          entity_present: False
+        nic_rail_3:
+          entity_present: False
+        nic_rail_4:
+          entity_present: False
+        sc_rail_0:
+          entity_present: True
+          entity_name: "sc_mount_0"
+          entity_pose:
+            translation: 0.0125
+            roll: 0.0
+            pitch: 0.0
+            yaw: 0.0
+        sc_rail_1:
+          entity_present: False
+        lc_mount_rail_0:
+          entity_present: False
+        sfp_mount_rail_0:
+          entity_present: False
+        sc_mount_rail_0:
+          entity_present: False
+        lc_mount_rail_1:
+          entity_present: False
+        sfp_mount_rail_1:
+          entity_present: False
+        sc_mount_rail_1:
+          entity_present: False
+      cables:
+        cable_0:
+          # DO NOT touch these values — they are the CablePlugin's expected
+          # attach pose for the SC plug, copied verbatim from
+          # sample_config.yaml trial_3. Setting them to (0,0,0) breaks the
+          # cable-to-gripper attach (cable detaches / falls).
+          pose:
+            gripper_offset:
+              x: 0.0
+              y: 0.015385
+              z: 0.04045
+            roll: 0.4432
+            pitch: -0.4838
+            yaw: 1.3303
+          attach_cable_to_gripper: True
+          cable_type: "sfp_sc_cable_reversed"
+    tasks:
+      task_1:
+        cable_type: "sfp_sc"
+        cable_name: "cable_0"
+        plug_type: "sc"
+        plug_name: "sc_tip"
+        port_type: "sc"
+        port_name: "sc_port_base"
+        target_module_name: "sc_port_0"
+        time_limit: 180
+
+robot:
+  # NOTE: the sample_config.yaml's home_joint_positions were calibrated for
+  # trial_3 which targets sc_port_1 (at Y=0.0705 on the board), not sc_port_0
+  # (Y=0.0295, 41 mm offset). The training data also used sc_port_0 but
+  # homed via Cartesian impedance to (-0.3719, 0.1943, 0.3286) ± random, not
+  # via joint reset. The joint values below are the *mean across 93 OK
+  # training episodes' first-frame joint states*, so eval starts from a pose
+  # that's actually in the training distribution.
+  home_joint_positions:
+    shoulder_pan_joint: -0.1391
+    shoulder_lift_joint: -1.3561
+    elbow_joint: -1.6853
+    wrist_1_joint: -1.6711
+    wrist_2_joint: 1.5708
+    wrist_3_joint: 1.4317
