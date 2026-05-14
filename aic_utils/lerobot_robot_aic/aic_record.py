@@ -122,6 +122,48 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
 
+        # File-based event sentinel (alternative to pynput keyboard arrows).
+        # External orchestrators write 'save' / 'discard' / 'stop' to the
+        # sentinel path; a daemon thread polls and sets the matching event
+        # flags. This avoids phantom keypress problems when the user is
+        # actively using the workstation. Path is overridable via
+        # AIC_RECORD_SENTINEL env var.
+        import os as _os, threading as _th, time as _time
+        _sentinel_path = _os.environ.get("AIC_RECORD_SENTINEL", "/tmp/aic_record_event")
+        try:
+            _os.remove(_sentinel_path)
+        except FileNotFoundError:
+            pass
+
+        def _poll_sentinel():
+            while not events["stop_recording"]:
+                try:
+                    if _os.path.exists(_sentinel_path):
+                        with open(_sentinel_path) as _f:
+                            _cmd = _f.read().strip()
+                        try:
+                            _os.remove(_sentinel_path)
+                        except FileNotFoundError:
+                            pass
+                        if _cmd == "save":
+                            logging.info(f"[sentinel] save -> exit_early")
+                            events["exit_early"] = True
+                        elif _cmd == "discard":
+                            logging.info(f"[sentinel] discard -> rerecord_episode + exit_early")
+                            events["rerecord_episode"] = True
+                            events["exit_early"] = True
+                        elif _cmd == "stop":
+                            logging.info(f"[sentinel] stop -> stop_recording + exit_early")
+                            events["stop_recording"] = True
+                            events["exit_early"] = True
+                        else:
+                            logging.warning(f"[sentinel] unknown command: {_cmd!r}")
+                except Exception as _e:
+                    logging.warning(f"[sentinel] poll error: {_e}")
+                _time.sleep(0.1)
+
+        _th.Thread(target=_poll_sentinel, daemon=True).start()
+
         # Reset BEFORE the first episode so episode 0 starts from the same
         # tared/respawned state as episodes 1+. Without this, episode 0
         # records raw (un-tared) F/T because /episode_reset otherwise only
