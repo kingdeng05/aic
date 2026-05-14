@@ -1,29 +1,93 @@
 #!/usr/bin/env bash
 # run_iter.sh — one iteration of cheatcode data collection.
 #
+# Multi-slot scene: every launch spawns all 5 NIC card mounts and both SC
+# ports. The orchestrator picks a *random* (mount, port) target per iter
+# from the requested connector family and conditions the policy via the
+# task-id one-hot appended to obs.state by the controller.
+#
+# Usage:
+#   run_iter.sh --connector=nic    # random NIC target (1 of 10)
+#   run_iter.sh --connector=sc     # random SC  target (1 of 2)
+#   run_iter.sh nic | sc           # legacy positional shortcut
+#
 # Stdout (last line):
-#   OUTCOME=<HOLD|TIMEOUT|LAUNCH_FAIL> REPO=<repo_id>
+#   OUTCOME=<HOLD|TIMEOUT|LAUNCH_FAIL> CONNECTOR=<nic|sc>
+#       TARGET=<mount>/<port> REPO=<repo_id>
 # Exit code: 0=HOLD, 1=TIMEOUT, 3=LAUNCH_FAIL.
 #
 # Steps:
-#   1. setsid distrobox-enter `aic_eval` and run launch_randomized_episode.sh
-#      headless (gazebo_gui:=false launch_rviz:=false)
-#   2. Wait up to 60s for the printed `[record]` block in stderr+stdout
-#   3. Wait up to 30s for `Tared FT sensor at home pose` (homing complete)
-#   4. Extract the pixi-record command via awk
-#   5. Run pixi-record on host with `env -u DISPLAY` (kills pynput so real
-#      user keystrokes can't reach lerobot's listener — see aic_record.py's
-#      file-sentinel polling thread for the new save/discard control path)
-#   6. On HOLD → 5s grace + write "save" to $SENTINEL.
+#   1. Pick a random target from the connector's table.
+#   2. setsid distrobox-enter `aic_eval` and run launch_randomized_episode.sh
+#      headless (gazebo_gui:=false launch_rviz:=false) with --all-slots-present
+#      --randomize-task-board, the picked --target and matching --plug-name /
+#      --cable-type.
+#   3. Wait up to 60s for the printed `[record]` block.
+#   4. Wait up to 30s for `Tared FT sensor at home pose`.
+#   5. Extract the pixi-record command (includes --robot.task_target_* so the
+#      controller emits the matching one-hot).
+#   6. Run pixi-record on host with `env -u DISPLAY` (pynput off; control via
+#      file sentinel — see aic_record.py).
+#   7. On HOLD → 5s grace + write "save" to $SENTINEL.
 #      On TIMEOUT  → write "discard" to $SENTINEL.
-#   7. If outcome != HOLD, rm -rf the dataset directory
-#   8. Tear down sim (broad pkill via distrobox)
+#   8. If outcome != HOLD, rm -rf the dataset directory.
+#   9. Teardown sim (broad pkill via distrobox).
 
 set -uo pipefail
 
-# CLI arg: target slot (defaults to nic_card_mount_0).
-# Usage: run_iter.sh [<slot>]
-SLOT="${1:-nic_card_mount_0}"
+# --- Argument parsing ----------------------------------------------------
+CONNECTOR=""
+for arg in "$@"; do
+    case "$arg" in
+        --connector=*)  CONNECTOR="${arg#*=}" ;;
+        nic|sc)         CONNECTOR="$arg" ;;
+        # Legacy compat: accept "<slot>" but only use it to infer connector.
+        nic_card_mount_*) CONNECTOR="nic" ;;
+        sc_port_*)        CONNECTOR="sc"  ;;
+        *) echo "run_iter.sh: unknown arg: $arg" >&2; exit 2 ;;
+    esac
+done
+CONNECTOR="${CONNECTOR:-nic}"  # default to NIC
+
+# --- Random target pick from the connector's table -----------------------
+PICK=$(CONNECTOR="$CONNECTOR" python3 - <<'PYEOF'
+import os, random
+nic_targets = [
+    ("nic_card_mount_0", "sfp_port_0"),
+    ("nic_card_mount_0", "sfp_port_1"),
+    ("nic_card_mount_1", "sfp_port_0"),
+    ("nic_card_mount_1", "sfp_port_1"),
+    ("nic_card_mount_2", "sfp_port_0"),
+    ("nic_card_mount_2", "sfp_port_1"),
+    ("nic_card_mount_3", "sfp_port_0"),
+    ("nic_card_mount_3", "sfp_port_1"),
+    ("nic_card_mount_4", "sfp_port_0"),
+    ("nic_card_mount_4", "sfp_port_1"),
+]
+sc_targets = [
+    # port_name is "sc_port" (cheatcode auto-appends "_link" to build
+    # the TF frame "task_board/sc_port_X/sc_port_link"). Must match the
+    # TASK_ID_TABLE keys in aic_robot_aic_controller.py.
+    ("sc_port_0", "sc_port"),
+    ("sc_port_1", "sc_port"),
+]
+connector = os.environ["CONNECTOR"]
+if connector == "nic":
+    pool = nic_targets
+    cable = "sfp_sc_cable"
+    plug  = "sfp_tip"
+elif connector == "sc":
+    pool = sc_targets
+    cable = "sfp_sc_cable_reversed"
+    plug  = "sc_tip"
+else:
+    raise SystemExit(f"unknown connector: {connector}")
+mount, port = random.choice(pool)
+print(f"{mount} {port} {cable} {plug}")
+PYEOF
+)
+read -r TARGET_MOUNT TARGET_PORT CABLE_TYPE PLUG_NAME <<< "$PICK"
+TARGET="${TARGET_MOUNT}/${TARGET_PORT}"
 
 WS=/home/sai/ws_aic_challenge
 SIM_OUT=/tmp/sim.out
@@ -53,9 +117,26 @@ send_event() {
 : > "$SIM_OUT"
 : > "$REC_LOG"
 
-# 1. Launch sim (headless: no gz gui, no rviz)
+# 1. Launch sim. Multi-slot scene with all NIC mounts + SC ports present.
+# Env-var knobs:
+#   AIC_RANDOMIZE_TASK_BOARD=0  → skip task-board pose randomization (default 1)
+#   AIC_GZ_GUI=1                → show gz GUI + rviz window (default 0 = headless)
+TASK_BOARD_FLAG=""
+if [[ "${AIC_RANDOMIZE_TASK_BOARD:-1}" != "0" ]]; then
+    TASK_BOARD_FLAG="--randomize-task-board"
+fi
+if [[ "${AIC_GZ_GUI:-0}" == "1" ]]; then
+    GUI_FLAGS="gazebo_gui:=true launch_rviz:=true"
+else
+    GUI_FLAGS="gazebo_gui:=false launch_rviz:=false"
+fi
+echo "[iter] connector=$CONNECTOR target=$TARGET cable=$CABLE_TYPE plug=$PLUG_NAME task_board_rand=${AIC_RANDOMIZE_TASK_BOARD:-1} gz_gui=${AIC_GZ_GUI:-0}" >&2
 setsid distrobox enter aic_eval -- bash -lc \
-    "cd $WS && ./src/aic/aic_bringup/scripts/launch_randomized_episode.sh ${SLOT}_present:=true --random-home-offset=0.06 gazebo_gui:=false launch_rviz:=false" \
+    "cd $WS && ./src/aic/aic_bringup/scripts/launch_randomized_episode.sh \
+        --all-slots-present $TASK_BOARD_FLAG \
+        --target=$TARGET --plug-name=$PLUG_NAME --cable-type=$CABLE_TYPE \
+        --random-home-offset=0.06 \
+        $GUI_FLAGS" \
     >"$SIM_OUT" 2>&1 &
 SIM_PID=$!
 
@@ -119,10 +200,15 @@ while kill -0 "$REC_PID" 2>/dev/null; do
 done
 
 # 7. Signal aic-record via file sentinel (no keyboard).
+# AIC_KEEP_DISCARDED=1 → save the partial episode on TIMEOUT for inspection
+# (smoke tests). Production: discard.
 if [[ $HOLD -eq 1 ]]; then
     sleep $GRACE
     send_event save
     OUTCOME=HOLD
+elif [[ "${AIC_KEEP_DISCARDED:-0}" == "1" ]]; then
+    send_event save  # save partial frames for schema inspection
+    OUTCOME=TIMEOUT
 else
     send_event discard
     OUTCOME=TIMEOUT
@@ -135,8 +221,9 @@ for _ in $(seq 1 30); do
 done
 kill -KILL "$REC_PID" 2>/dev/null || true
 
-# 9. Delete dataset on non-HOLD outcomes
-if [[ "$OUTCOME" != HOLD ]]; then
+# 9. Delete dataset on non-HOLD outcomes (skip if AIC_KEEP_DISCARDED=1 — used
+# for smoke tests / schema verification where we want the partial parquet).
+if [[ "$OUTCOME" != HOLD && "${AIC_KEEP_DISCARDED:-0}" != "1" ]]; then
     rm -rf "$HOME/.cache/huggingface/lerobot/$REPO_ID" 2>/dev/null || true
 fi
 
@@ -144,7 +231,7 @@ fi
 teardown
 
 # 11. Report
-echo "OUTCOME=$OUTCOME REPO=$REPO_ID"
+echo "OUTCOME=$OUTCOME CONNECTOR=$CONNECTOR TARGET=$TARGET REPO=$REPO_ID"
 case "$OUTCOME" in
     HOLD)    exit 0 ;;
     TIMEOUT) exit 1 ;;

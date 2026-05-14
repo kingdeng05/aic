@@ -6,48 +6,104 @@
 #   1. Auto-samples translation/yaw within docs ranges for any task-board slot
 #      passed with `<slot>_present:=true` (unless --no-randomize is set or the
 #      caller supplied an explicit value for that key).
-#   2. Generates a unique dataset repo_id (timestamp-based) for one-shot
+#   2. With --all-slots-present, injects nic_card_mount_{0..4}_present:=true
+#      AND sc_port_{0,1}_present:=true so a single launch produces a scene
+#      with every NIC + SC slot visible (per-slot pose still randomized).
+#   3. With --randomize-task-board, samples task_board_x/y/z (slight jitter)
+#      and task_board_yaw ∈ [−π, +π] (full 360° sweep) for visual variety.
+#   4. Generates a unique dataset repo_id (timestamp-based) for one-shot
 #      single-episode capture, since /episode_reset is not used.
-#   3. Prints the matching `pixi run aic-record` command for the second
-#      terminal.
-#   4. Sources the workspace, starts rmw_zenohd, and execs the launch.
+#   5. Prints the matching `pixi run aic-record` command. The target slot +
+#      port are passed both to the teleop (target_module_name/port_name) AND
+#      the robot (task_target_module/task_target_port) so the controller can
+#      append the matching task-id one-hot to obs.state.
+#   6. Sources the workspace, starts rmw_zenohd, and execs the launch.
 #
 # Usage:
 #   launch_randomized_episode.sh \
 #     [<launch arg=val>...] \
-#     [--target=<slot>] [--cable-type=<type>] [--episode-time-s=<int>] \
-#     [--dataset-prefix=<s>] [--seed=<int>] [--no-randomize] [--dry-run]
+#     [--target=<mount>[/<port>]] [--plug-name=<name>] \
+#     [--cable-type=<type>] [--episode-time-s=<int>] \
+#     [--dataset-prefix=<s>] [--seed=<int>] \
+#     [--all-slots-present] [--randomize-task-board] \
+#     [--no-randomize] [--dry-run] \
 #     [-- <extra ros2 launch args>]
+#
+# Examples:
+#   # Multi-slot NIC scene, random NIC target:
+#   ./launch_randomized_episode.sh --all-slots-present --randomize-task-board \
+#       --target=nic_card_mount_2/sfp_port_1 --plug-name=sfp_tip
+#
+#   # Multi-slot SC scene, SC target:
+#   ./launch_randomized_episode.sh --all-slots-present --randomize-task-board \
+#       --cable-type=sfp_sc_cable_reversed --target=sc_port_0/sc_port_link \
+#       --plug-name=sc_tip
 #
 # The <launch arg=val> items use the same `key:=value` syntax as `ros2 launch`.
 
 set -euo pipefail
 
-TARGET=""
+TARGET=""                 # raw arg, may be "<mount>" or "<mount>/<port>"
+TARGET_MOUNT=""
+TARGET_PORT=""
+PLUG_NAME="sfp_tip"       # default: NIC head plug. SC head should pass sc_tip.
 CABLE_TYPE="sfp_sc_cable"
 EPISODE_TIME_S=600
 DATASET_PREFIX="cheatcode"
 SEED=$RANDOM
 RANDOMIZE=1
 RANDOM_HOME_OFFSET="0.06"
+ALL_SLOTS=0
+RANDOMIZE_TASK_BOARD=0
 DRY_RUN=0
 LAUNCH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target=*)             TARGET="${1#*=}";              shift ;;
-        --cable-type=*)         CABLE_TYPE="${1#*=}";          shift ;;
-        --episode-time-s=*)     EPISODE_TIME_S="${1#*=}";      shift ;;
-        --dataset-prefix=*)     DATASET_PREFIX="${1#*=}";      shift ;;
-        --seed=*)               SEED="${1#*=}";                shift ;;
-        --random-home-offset=*) RANDOM_HOME_OFFSET="${1#*=}";  shift ;;
-        --no-randomize)         RANDOMIZE=0;                   shift ;;
-        --dry-run)              DRY_RUN=1;                     shift ;;
-        --)                     shift; LAUNCH_ARGS+=("$@"); break ;;
-        *:=*)                   LAUNCH_ARGS+=("$1");           shift ;;
+        --target=*)               TARGET="${1#*=}";              shift ;;
+        --plug-name=*)            PLUG_NAME="${1#*=}";           shift ;;
+        --cable-type=*)           CABLE_TYPE="${1#*=}";          shift ;;
+        --episode-time-s=*)       EPISODE_TIME_S="${1#*=}";      shift ;;
+        --dataset-prefix=*)       DATASET_PREFIX="${1#*=}";      shift ;;
+        --seed=*)                 SEED="${1#*=}";                shift ;;
+        --random-home-offset=*)   RANDOM_HOME_OFFSET="${1#*=}";  shift ;;
+        --all-slots-present)      ALL_SLOTS=1;                   shift ;;
+        --randomize-task-board)   RANDOMIZE_TASK_BOARD=1;        shift ;;
+        --no-randomize)           RANDOMIZE=0;                   shift ;;
+        --dry-run)                DRY_RUN=1;                     shift ;;
+        --)                       shift; LAUNCH_ARGS+=("$@"); break ;;
+        *:=*)                     LAUNCH_ARGS+=("$1");           shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
+
+# Parse --target=<mount>[/<port>]. If port is omitted we keep TARGET_PORT
+# empty; downstream code will fall back to a per-mount default.
+if [[ -n "$TARGET" ]]; then
+    if [[ "$TARGET" == */* ]]; then
+        TARGET_MOUNT="${TARGET%%/*}"
+        TARGET_PORT="${TARGET#*/}"
+    else
+        TARGET_MOUNT="$TARGET"
+        TARGET_PORT=""
+    fi
+fi
+
+# --all-slots-present injects every NIC + SC slot if the caller hasn't
+# already passed an explicit *_present arg for it.
+if [[ $ALL_SLOTS -eq 1 ]]; then
+    declare -a SLOTS_TO_PRESENT=(
+        nic_card_mount_0 nic_card_mount_1 nic_card_mount_2
+        nic_card_mount_3 nic_card_mount_4
+        sc_port_0 sc_port_1
+    )
+    EXISTING=" ${LAUNCH_ARGS[*]:-} "
+    for slot in "${SLOTS_TO_PRESENT[@]}"; do
+        if [[ "$EXISTING" != *" ${slot}_present:="* ]]; then
+            LAUNCH_ARGS+=("${slot}_present:=true")
+        fi
+    done
+fi
 
 if [[ $RANDOMIZE -eq 1 ]]; then
     SAMPLED=$(LAUNCH_ARGS_STR="${LAUNCH_ARGS[*]:-}" SEED="$SEED" python3 - <<'PYEOF'
@@ -88,13 +144,52 @@ PYEOF
     fi
 fi
 
-if [[ -z "$TARGET" ]]; then
+if [[ -z "$TARGET_MOUNT" ]]; then
     for arg in "${LAUNCH_ARGS[@]}"; do
         if [[ "$arg" =~ ^([a-z_]+_[0-9]+)_present:=true$ ]]; then
-            TARGET="${BASH_REMATCH[1]}"
+            TARGET_MOUNT="${BASH_REMATCH[1]}"
             break
         fi
     done
+fi
+# Per-mount default port if caller didn't specify one.
+if [[ -n "$TARGET_MOUNT" && -z "$TARGET_PORT" ]]; then
+    case "$TARGET_MOUNT" in
+        nic_card_mount_*) TARGET_PORT="sfp_port_0" ;;
+        sc_port_*)        TARGET_PORT="sc_port_link" ;;
+        *)                TARGET_PORT="sfp_port_0" ;;
+    esac
+fi
+
+# Sample task-board pose if requested. task_board_x/y/z/yaw are live launch
+# args (defaults: x=0.15, y=-0.20, z=1.14, yaw=3.1415 rad — declared in
+# aic_gz_bringup.launch.py:667-706). Slight DELTA jitter on xyz around those
+# defaults; yaw is a full 360° sweep absolute (cyclic).
+TASK_BOARD_SUMMARY=""
+if [[ $RANDOMIZE_TASK_BOARD -eq 1 ]]; then
+    TB_OUT=$(SEED="$SEED" python3 - <<'PYEOF'
+import os, math, random
+rng = random.Random(int(os.environ["SEED"]) ^ 0xC0DE)
+TB_DEFAULT_X, TB_DEFAULT_Y, TB_DEFAULT_Z = 0.15, -0.20, 1.14
+dx = rng.uniform(-0.02, 0.02)
+dy = rng.uniform(-0.02, 0.02)
+dz = rng.uniform(-0.005, 0.005)
+x = TB_DEFAULT_X + dx
+y = TB_DEFAULT_Y + dy
+z = TB_DEFAULT_Z + dz
+yaw = rng.uniform(-math.pi, math.pi)
+print(f"task_board_x:={x:.6f} task_board_y:={y:.6f} task_board_z:={z:.6f} task_board_yaw:={yaw:.6f}")
+print("---SUMMARY---")
+print(f"  Δx = {dx:+.4f} m   Δy = {dy:+.4f} m   Δz = {dz:+.4f} m   yaw = {yaw:+.4f} rad ({math.degrees(yaw):+.2f} deg)")
+print(f"  abs: x = {x:+.4f}  y = {y:+.4f}  z = {z:+.4f}")
+PYEOF
+)
+    TB_ARGS_LINE="${TB_OUT%%$'\n---SUMMARY---'*}"
+    TASK_BOARD_SUMMARY="${TB_OUT##*---SUMMARY---$'\n'}"
+    # shellcheck disable=SC2206
+    LAUNCH_ARGS+=($TB_ARGS_LINE)
+else
+    TASK_BOARD_SUMMARY="  disabled (no --randomize-task-board)"
 fi
 
 # Sample home offset (dx, dy, dz) once and forward to home_robot.py via
@@ -176,23 +271,27 @@ PYEOF
 cat >&2 <<EOF
 [sim] seed=${SEED}
 [sim] dataset=${REPO_ID}
-[sim] target=${TARGET:-<none — pass <slot>_present:=true>}
+[sim] cable_type=${CABLE_TYPE}  plug_name=${PLUG_NAME}
+[sim] target=${TARGET_MOUNT:-<unset>}/${TARGET_PORT:-<unset>}
 [sim] scene:
 ${SCENE_SUMMARY}
+[sim] task board (--randomize-task-board=${RANDOMIZE_TASK_BOARD}):
+${TASK_BOARD_SUMMARY}
 [sim] home offset (--random-home-offset=${RANDOM_HOME_OFFSET}):
 ${HOME_OFFSET_SUMMARY}
 [record] paste this in another terminal:
   pixi run aic-record \\
     --robot.type=aic_controller --robot.id=aic \\
     --teleop.type=cheatcode --teleop.id=aic \\
-    --teleop.cable_name=cable_0 --teleop.plug_name=sfp_tip \\
-    --teleop.target_module_name=${TARGET} --teleop.port_name=sfp_port_0 \\
+    --teleop.cable_name=cable_0 --teleop.plug_name=${PLUG_NAME} \\
+    --teleop.target_module_name=${TARGET_MOUNT} --teleop.port_name=${TARGET_PORT} \\
     --teleop.approach_noise_xyz_m=0 \\
     --teleop.descent_noise_xyz_m=0 \\
     --teleop.approach_rot_noise_deg=0 \\
     --robot.teleop_target_mode=pose --robot.teleop_frame_id=gripper/tcp \\
+    --robot.task_target_module=${TARGET_MOUNT} --robot.task_target_port=${TARGET_PORT} \\
     --dataset.repo_id=${REPO_ID} \\
-    --dataset.single_task="Insert SFP SC cable into NIC card port" \\
+    --dataset.single_task="Insert SFP cable into ${TARGET_MOUNT}/${TARGET_PORT}" \\
     --dataset.push_to_hub=false --play_sounds=false --display_data=false \\
     --dataset.num_episodes=1 --dataset.episode_time_s=${EPISODE_TIME_S} --dataset.reset_time_s=0
 EOF

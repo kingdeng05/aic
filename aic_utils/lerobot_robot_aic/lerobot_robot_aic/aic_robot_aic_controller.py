@@ -67,43 +67,73 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 
-ObservationState = TypedDict(
-    "ObservationState",
-    {
-        "tcp_pose.position.x": float,
-        "tcp_pose.position.y": float,
-        "tcp_pose.position.z": float,
-        "tcp_pose.orientation.x": float,
-        "tcp_pose.orientation.y": float,
-        "tcp_pose.orientation.z": float,
-        "tcp_pose.orientation.w": float,
-        "tcp_velocity.linear.x": float,
-        "tcp_velocity.linear.y": float,
-        "tcp_velocity.linear.z": float,
-        "tcp_velocity.angular.x": float,
-        "tcp_velocity.angular.y": float,
-        "tcp_velocity.angular.z": float,
-        "tcp_error.x": float,
-        "tcp_error.y": float,
-        "tcp_error.z": float,
-        "tcp_error.rx": float,
-        "tcp_error.ry": float,
-        "tcp_error.rz": float,
-        "joint_positions.0": float,
-        "joint_positions.1": float,
-        "joint_positions.2": float,
-        "joint_positions.3": float,
-        "joint_positions.4": float,
-        "joint_positions.5": float,
-        "joint_positions.6": float,
-        "wrench.force.x": float,
-        "wrench.force.y": float,
-        "wrench.force.z": float,
-        "wrench.torque.x": float,
-        "wrench.torque.y": float,
-        "wrench.torque.z": float,
-    },
-)
+# Stable global enumeration of (mount, port) targets used as a fixed-shape
+# one-hot conditioning vector appended to obs.state. The index order here is
+# part of the dataset contract — APPEND ONLY. NIC-head datasets only fire
+# indices 0..9; SC-head datasets only fire indices 10..11; same shape across
+# both heads so a single ACT model architecture works for either.
+# NOTE: port_name values match the convention cheatcode_teleop.py uses to
+# build the target TF frame name — it appends "_link" itself
+# (see cheatcode_teleop.py:163  →  f"task_board/{module}/{port}_link").
+# So for the SC slot whose actual SDF link is "sc_port_link", the
+# port_name here must be "sc_port" (cheatcode resolves to "sc_port_link").
+# For NIC the actual link is "sfp_port_0_link" so port_name is "sfp_port_0".
+TASK_ID_TABLE: list[tuple[str, str]] = [
+    ("nic_card_mount_0", "sfp_port_0"),
+    ("nic_card_mount_0", "sfp_port_1"),
+    ("nic_card_mount_1", "sfp_port_0"),
+    ("nic_card_mount_1", "sfp_port_1"),
+    ("nic_card_mount_2", "sfp_port_0"),
+    ("nic_card_mount_2", "sfp_port_1"),
+    ("nic_card_mount_3", "sfp_port_0"),
+    ("nic_card_mount_3", "sfp_port_1"),
+    ("nic_card_mount_4", "sfp_port_0"),
+    ("nic_card_mount_4", "sfp_port_1"),
+    ("sc_port_0",        "sc_port"),
+    ("sc_port_1",        "sc_port"),
+]
+TASK_ID_DIM: int = len(TASK_ID_TABLE)
+TASK_ID_INDEX: dict[tuple[str, str], int] = {k: i for i, k in enumerate(TASK_ID_TABLE)}
+
+
+# Build the ObservationState TypedDict programmatically so the trailing
+# task_id_one_hot.* field count stays in lockstep with TASK_ID_DIM.
+_OBS_STATE_FIELDS: dict[str, type] = {
+    "tcp_pose.position.x": float,
+    "tcp_pose.position.y": float,
+    "tcp_pose.position.z": float,
+    "tcp_pose.orientation.x": float,
+    "tcp_pose.orientation.y": float,
+    "tcp_pose.orientation.z": float,
+    "tcp_pose.orientation.w": float,
+    "tcp_velocity.linear.x": float,
+    "tcp_velocity.linear.y": float,
+    "tcp_velocity.linear.z": float,
+    "tcp_velocity.angular.x": float,
+    "tcp_velocity.angular.y": float,
+    "tcp_velocity.angular.z": float,
+    "tcp_error.x": float,
+    "tcp_error.y": float,
+    "tcp_error.z": float,
+    "tcp_error.rx": float,
+    "tcp_error.ry": float,
+    "tcp_error.rz": float,
+    "joint_positions.0": float,
+    "joint_positions.1": float,
+    "joint_positions.2": float,
+    "joint_positions.3": float,
+    "joint_positions.4": float,
+    "joint_positions.5": float,
+    "joint_positions.6": float,
+    "wrench.force.x": float,
+    "wrench.force.y": float,
+    "wrench.force.z": float,
+    "wrench.torque.x": float,
+    "wrench.torque.y": float,
+    "wrench.torque.z": float,
+    **{f"task_id_one_hot.{i}": float for i in range(TASK_ID_DIM)},
+}
+ObservationState = TypedDict("ObservationState", _OBS_STATE_FIELDS)
 
 
 class CameraImageScaling(TypedDict):
@@ -128,6 +158,14 @@ class AICRobotAICControllerConfig(RobotConfig):
             "right_camera": 0.25,
         }
     )
+
+    # Task-id conditioning. When the orchestrator picks a (mount, port) target
+    # for an episode it passes the strings here so the controller appends the
+    # matching one-hot to every obs.state tick. If left empty (default), an
+    # all-zero one-hot is emitted — handy for backward compat / eval-time
+    # checkpoints that don't need conditioning.
+    task_target_module: str = ""  # e.g. "nic_card_mount_2"
+    task_target_port: str = ""    # e.g. "sfp_port_1"
 
 
 @dataclass(kw_only=True)
@@ -245,6 +283,25 @@ class AICRobotAICController(Robot):
 
         print(f"Teleop frame id: {self.frame_id}")
         print(f"Teleop target mode: {self.teleop_target_mode}")
+
+        # Pre-compute the task-id one-hot from the configured (module, port)
+        # target. Looked up once on construction; if the target isn't in the
+        # global table we emit an all-zero vector and warn (keeps the schema
+        # stable for backward-compat checkpoints / dataset replays).
+        self._task_id_one_hot: list[float] = [0.0] * TASK_ID_DIM
+        target_key = (config.task_target_module, config.task_target_port)
+        if config.task_target_module or config.task_target_port:
+            idx = TASK_ID_INDEX.get(target_key)
+            if idx is None:
+                print(
+                    f"[task-id] WARNING: target {target_key!r} not in TASK_ID_TABLE; "
+                    f"emitting all-zero one-hot (dim={TASK_ID_DIM})"
+                )
+            else:
+                self._task_id_one_hot[idx] = 1.0
+                print(f"[task-id] target={target_key!r} -> one-hot index {idx}/{TASK_ID_DIM}")
+        else:
+            print(f"[task-id] no target configured (empty one-hot dim={TASK_ID_DIM})")
 
     def send_change_control_mode_req(self, mode: int):
         if not self.ros2_interface:
@@ -414,6 +471,10 @@ class AICRobotAICController(Robot):
             "wrench.torque.x": wrench.torque.x,
             "wrench.torque.y": wrench.torque.y,
             "wrench.torque.z": wrench.torque.z,
+            **{
+                f"task_id_one_hot.{i}": self._task_id_one_hot[i]
+                for i in range(TASK_ID_DIM)
+            },
         }
 
         # Capture images from cameras

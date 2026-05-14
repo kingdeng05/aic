@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Slim observation.state down to non-leaky channels (tcp_velocity + wrench).
+"""Slim observation.state down to non-leaky channels (tcp_velocity + wrench
++ task_id_one_hot).
 
-Source layout (rot6d dataset, observation.state shape=34):
+Source layout (rot6d dataset, observation.state shape=46 — 34 from the rot6d
+conversion of the original 32-D layout plus 12 task_id_one_hot fields the
+controller now appends):
    0..2    tcp_pose.position.{x,y,z}                <- DROP (leaks position)
    3..8    tcp_pose.rot6d.{0..5}                    <- DROP (leaks orientation, near-constant)
    9..11   tcp_velocity.linear.{x,y,z}              <- KEEP
@@ -11,9 +14,11 @@ Source layout (rot6d dataset, observation.state shape=34):
   21..27   joint_positions.{0..6}                   <- DROP (R^2=0.84 -> 0.9999 leak)
   28..30   wrench.force.{x,y,z}                     <- KEEP
   31..33   wrench.torque.{x,y,z}                    <- KEEP
+  34..45   task_id_one_hot.{0..11}                  <- KEEP (task conditioning)
 
-Output observation.state shape: 12  [tcp_velocity (6) + wrench (6)]
-Action is NOT modified (stays 9D rot6d).
+Output observation.state shape: 24  [tcp_velocity (6) + wrench (6) + task one-hot (12)]
+Same shape for NIC and SC datasets — NIC fires indices 0..9 of the one-hot,
+SC fires indices 10..11. Action is NOT modified (stays 9D rot6d).
 
 Usage:
   pixi run python aic_utils/lerobot_robot_aic/slim_observation_state.py \
@@ -94,10 +99,10 @@ def main() -> None:
     print(f"  source obs.state: shape={state_shape}, names={len(state_names)}")
     assert len(state_names) == state_shape
 
-    KEEP_PREFIXES = ["tcp_velocity.", "wrench."]
+    KEEP_PREFIXES = ["tcp_velocity.", "wrench.", "task_id_one_hot."]
     keep_idx, keep_names = find_indices(state_names, KEEP_PREFIXES)
     print(f"  keeping {len(keep_idx)} dims: {keep_names}")
-    assert len(keep_idx) == 12, f"expected 12 kept dims, got {len(keep_idx)}"
+    assert len(keep_idx) == 24, f"expected 24 kept dims (6 vel + 6 wrench + 12 task), got {len(keep_idx)}"
 
     data = pd.read_parquet(SRC / "data/chunk-000/file-000.parquet")
     n = len(data)

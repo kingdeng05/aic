@@ -3,11 +3,15 @@
 
 Source dataset layout (e.g. nic_card_mount_0_merged_trimmed):
   action          : [px, py, pz, qw, qx, qy, qz]                          (7D)
-  observation.state: [..., tcp_pose.orientation.{x,y,z,w}, ...]           (32D)
+  observation.state: [tcp_pose.position.{x,y,z}, tcp_pose.orientation.{x,y,z,w},
+                      tcp_velocity{6}, tcp_error{6}, joint_positions{7},
+                      wrench{6}, task_id_one_hot{12}]                     (44D)
 
 Output:
   action          : [px, py, pz, rot6d.0..rot6d.5]                        (9D)
-  observation.state: [..., tcp_pose.rot6d.{0..5}, ...]                    (34D)
+  observation.state: [tcp_pose.position{3}, tcp_pose.rot6d{6}, tcp_velocity{6},
+                      tcp_error{6}, joint_positions{7}, wrench{6},
+                      task_id_one_hot{12}]                                 (46D)
 
 The 6D rotation representation is the first two columns of the rotation matrix,
 flattened column-wise: [R[:,0]; R[:,1]] (Zhou et al., "On the Continuity of
@@ -144,7 +148,11 @@ def convert_actions(action: np.ndarray) -> np.ndarray:
 
 
 def convert_states(state: np.ndarray) -> np.ndarray:
-    """(N, 32) with quaternion in xyzw order at indices 3..6 -> (N, 34) with rot6d."""
+    """(N, 44) with quaternion in xyzw order at indices 3..6 -> (N, 46) with rot6d.
+
+    The trailing 12 dims (task_id_one_hot.0..11) ride along via the
+    `state[:, 7:]` tail slice — unaffected by the rot6d rewrite.
+    """
     quat_xyzw = state[:, 3:7]
     quat_wxyz = quat_xyzw[:, [3, 0, 1, 2]]
     R = quat_wxyz_to_matrix(quat_wxyz)
@@ -187,7 +195,7 @@ def main() -> None:
     action = np.stack(data["action"].to_numpy()).astype(np.float64)
     state = np.stack(data["observation.state"].to_numpy()).astype(np.float64)
     assert action.shape == (n, 7), f"unexpected action shape {action.shape}"
-    assert state.shape == (n, 32), f"unexpected state shape {state.shape}"
+    assert state.shape == (n, 44), f"unexpected state shape {state.shape} (expected 44 = 32 base + 12 task one-hot)"
 
     # --- Convert ---
     action_new = convert_actions(action)
@@ -220,7 +228,7 @@ def main() -> None:
     info["features"]["observation.state"] = {
         "dtype": "float32",
         "names": new_state_names,
-        "shape": [34],
+        "shape": [46],
     }
     (OUT / "meta/info.json").write_text(json.dumps(info, indent=4))
     print(f"  wrote info.json (action shape={info['features']['action']['shape']}, "
