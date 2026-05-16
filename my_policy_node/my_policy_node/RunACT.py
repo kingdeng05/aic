@@ -42,6 +42,32 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from safetensors.torch import load_file
 
 
+# Stable target enumeration. MUST stay in lockstep with TASK_ID_TABLE in
+# aic_robot_aic_controller.py — re-ordering or inserting breaks every trained
+# checkpoint's one-hot encoding. Append-only.
+TASK_ID_TABLE: list[tuple[str, str]] = [
+    ("nic_card_mount_0", "sfp_port_0"),
+    ("nic_card_mount_0", "sfp_port_1"),
+    ("nic_card_mount_1", "sfp_port_0"),
+    ("nic_card_mount_1", "sfp_port_1"),
+    ("nic_card_mount_2", "sfp_port_0"),
+    ("nic_card_mount_2", "sfp_port_1"),
+    ("nic_card_mount_3", "sfp_port_0"),
+    ("nic_card_mount_3", "sfp_port_1"),
+    ("nic_card_mount_4", "sfp_port_0"),
+    ("nic_card_mount_4", "sfp_port_1"),
+    ("sc_port_0",        "sc_port"),
+    ("sc_port_1",        "sc_port"),
+]
+TASK_ID_DIM: int = len(TASK_ID_TABLE)
+TASK_ID_INDEX: dict[tuple[str, str], int] = {k: i for i, k in enumerate(TASK_ID_TABLE)}
+# Aliases: the portal's sample_config trial_3 sends port_name="sc_port_base"
+# while our table key uses "sc_port". Map both spellings to the same SC index
+# so SC trials produce a real one-hot, not an all-zero fallback.
+TASK_ID_INDEX[("sc_port_0", "sc_port_base")] = TASK_ID_INDEX[("sc_port_0", "sc_port")]
+TASK_ID_INDEX[("sc_port_1", "sc_port_base")] = TASK_ID_INDEX[("sc_port_1", "sc_port")]
+
+
 def _rot6d_to_matrix(d6: np.ndarray) -> np.ndarray:
     """Gram-Schmidt decode (Zhou et al.). (6,) -> (3, 3)."""
     a1, a2 = d6[:3], d6[3:]
@@ -89,78 +115,23 @@ class RunACT(Policy):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # -------------------------------------------------------------------------
-        # 1. Configuration & Weights Loading
+        # Dual-head load: NIC head + SC head. Head is selected per-task in
+        # insert_cable() based on task.target_module_name.
         # -------------------------------------------------------------------------
-        policy_path = Path(os.environ.get(
-            "AIC_ACT_MODEL_PATH",
-            # "/home/fuheng/ws_aic/src/aic/outputs/train/act_cable_insertion_v5/checkpoints/100000/pretrained_model",
-            # "/home/sai/.cache/huggingface/lerobot/checkpoints/080000/pretrained_model",
-            "/home/sai/.cache/huggingface/lerobot/models/outputs/train/nic_card_mount_0_merged_trimmed_rot6d_slim/checkpoints/020000/pretrained_model"
+        nic_path = Path(os.environ.get(
+            "AIC_ACT_MODEL_PATH_NIC",
+            "/home/sai/.cache/huggingface/lerobot/models/outputs/train/nic_multislot_200_merged_trimmed_rot6d_slim/checkpoints/200000/pretrained_model",
         ))
-
-        # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
-        with open(policy_path / "config.json", "r") as f:
-            config_dict = json.load(f)
-            if "type" in config_dict:
-                del config_dict["type"]
-
-        config = draccus.decode(ACTConfig, config_dict)
-
-        # Load Policy Architecture & Weights
-        self.policy = ACTPolicy(config)
-        model_weights_path = policy_path / "model.safetensors"
-        self.policy.load_state_dict(load_file(model_weights_path))
-        self.policy.eval()
-        self.policy.to(self.device)
-
-        self.get_logger().info(f"ACT Policy loaded on {self.device} from {policy_path}")
-
-        # -------------------------------------------------------------------------
-        # 2. Normalization Stats Loading
-        # -------------------------------------------------------------------------
-        # Observation normalization stats (preprocessor)
-        obs_stats = load_file(
-            policy_path / "policy_preprocessor_step_3_normalizer_processor.safetensors"
-        )
-
-        # Action denormalization stats (postprocessor)
-        action_stats = load_file(
-            policy_path / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
-        )
-
-        # Helper to extract and shape stats for broadcasting
-        def get_obs_stat(key, shape):
-            return obs_stats[key].to(self.device).view(*shape)
-
-        def get_action_stat(key, shape):
-            return action_stats[key].to(self.device).view(*shape)
-
-        # Image Stats (1, 3, 1, 1) for broadcasting against (Batch, Channel, Height, Width)
-        self.img_stats = {
-            "left": {
-                "mean": get_obs_stat("observation.images.left_camera.mean", (1, 3, 1, 1)),
-                "std": get_obs_stat("observation.images.left_camera.std", (1, 3, 1, 1)),
-            },
-            "center": {
-                "mean": get_obs_stat("observation.images.center_camera.mean", (1, 3, 1, 1)),
-                "std": get_obs_stat("observation.images.center_camera.std", (1, 3, 1, 1)),
-            },
-            "right": {
-                "mean": get_obs_stat("observation.images.right_camera.mean", (1, 3, 1, 1)),
-                "std": get_obs_stat("observation.images.right_camera.std", (1, 3, 1, 1)),
-            },
+        sc_path = Path(os.environ.get(
+            "AIC_ACT_MODEL_PATH_SC",
+            "/home/sai/ws_aic_challenge/src/aic/models/sc_overnight3_cart6d_cs25",
+        ))
+        self.heads = {
+            "nic": self._load_head("NIC", nic_path),
+            "sc":  self._load_head("SC",  sc_path),
         }
-        print(f"Image stats: {self.img_stats}")
-
-        self.state_mean = get_obs_stat("observation.state.mean", (1, -1))
-        self.state_std = get_obs_stat("observation.state.std", (1, -1))
-        print(f"Robot state mean: {self.state_mean}")
-        print(f"Robot state std: {self.state_std}")
-
-        self.action_mean = get_action_stat("action.mean", (1, -1))
-        self.action_std = get_action_stat("action.std", (1, -1))
-        print(f"Action mean: {self.action_mean}")
-        print(f"Action std: {self.action_std}")
+        # Default until first task arrives — picked properly in insert_cable().
+        self.active = self.heads["nic"]
 
         # Config
         self.image_scaling = 0.25  # Must match AICRobotAICControllerConfig
@@ -173,7 +144,59 @@ class RunACT(Policy):
                 "AIC_ACT_BLANK_IMAGES=1 — feeding zero (black) images to the policy."
             )
 
-        self.get_logger().info("Normalization statistics loaded successfully.")
+    def _load_head(self, label: str, policy_path: Path) -> dict:
+        """Load one ACT head (policy weights + normalization stats) into a dict."""
+        with open(policy_path / "config.json", "r") as f:
+            config_dict = json.load(f)
+            if "type" in config_dict:
+                del config_dict["type"]
+        config = draccus.decode(ACTConfig, config_dict)
+
+        policy = ACTPolicy(config)
+        policy.load_state_dict(load_file(policy_path / "model.safetensors"))
+        policy.eval()
+        policy.to(self.device)
+
+        obs_stats = load_file(
+            policy_path / "policy_preprocessor_step_3_normalizer_processor.safetensors"
+        )
+        action_stats = load_file(
+            policy_path / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+        )
+
+        def gobs(key, shape):
+            return obs_stats[key].to(self.device).view(*shape)
+
+        def gact(key, shape):
+            return action_stats[key].to(self.device).view(*shape)
+
+        img_stats = {
+            side: {
+                "mean": gobs(f"observation.images.{side}_camera.mean", (1, 3, 1, 1)),
+                "std":  gobs(f"observation.images.{side}_camera.std",  (1, 3, 1, 1)),
+            }
+            for side in ("left", "center", "right")
+        }
+        state_mean = gobs("observation.state.mean", (1, -1))
+        state_std = gobs("observation.state.std", (1, -1))
+        # Replace zero std with 1.0 to avoid div-by-zero -> NaN on constant
+        # channels (e.g. NIC-only or SC-only one-hot indices). Matches lerobot's
+        # NormalizerProcessor behavior.
+        state_std = torch.where(state_std == 0, torch.ones_like(state_std), state_std)
+        action_mean = gact("action.mean", (1, -1))
+        action_std = gact("action.std", (1, -1))
+
+        self.get_logger().info(f"[{label}] ACT loaded on {self.device} from {policy_path}")
+        self.get_logger().info(f"[{label}] state_mean shape={tuple(state_mean.shape)}  action_mean shape={tuple(action_mean.shape)}")
+
+        return {
+            "policy": policy,
+            "img_stats": img_stats,
+            "state_mean": state_mean,
+            "state_std": state_std,
+            "action_mean": action_mean,
+            "action_std": action_std,
+        }
 
     def _blank_image_tensor(
         self, mean: torch.Tensor, std: torch.Tensor
@@ -217,19 +240,22 @@ class RunACT(Policy):
         return (tensor - mean) / std
 
     def prepare_observations(self, obs_msg: Observation) -> Dict[str, torch.Tensor]:
-        """Convert ROS Observation message into dictionary of normalized tensors."""
+        """Convert ROS Observation message into dictionary of normalized tensors,
+        using the currently-active head's normalization stats (set in insert_cable)."""
+
+        img_stats = self.active["img_stats"]
 
         # --- Process Cameras ---
         if self.blank_images:
             obs = {
                 "observation.images.left_camera": self._blank_image_tensor(
-                    self.img_stats["left"]["mean"], self.img_stats["left"]["std"]
+                    img_stats["left"]["mean"], img_stats["left"]["std"]
                 ),
                 "observation.images.center_camera": self._blank_image_tensor(
-                    self.img_stats["center"]["mean"], self.img_stats["center"]["std"]
+                    img_stats["center"]["mean"], img_stats["center"]["std"]
                 ),
                 "observation.images.right_camera": self._blank_image_tensor(
-                    self.img_stats["right"]["mean"], self.img_stats["right"]["std"]
+                    img_stats["right"]["mean"], img_stats["right"]["std"]
                 ),
             }
         else:
@@ -238,22 +264,22 @@ class RunACT(Policy):
                     obs_msg.left_image,
                     self.device,
                     self.image_scaling,
-                    self.img_stats["left"]["mean"],
-                    self.img_stats["left"]["std"],
+                    img_stats["left"]["mean"],
+                    img_stats["left"]["std"],
                 ),
                 "observation.images.center_camera": self._img_to_tensor(
                     obs_msg.center_image,
                     self.device,
                     self.image_scaling,
-                    self.img_stats["center"]["mean"],
-                    self.img_stats["center"]["std"],
+                    img_stats["center"]["mean"],
+                    img_stats["center"]["std"],
                 ),
                 "observation.images.right_camera": self._img_to_tensor(
                     obs_msg.right_image,
                     self.device,
                     self.image_scaling,
-                    self.img_stats["right"]["mean"],
-                    self.img_stats["right"]["std"],
+                    img_stats["right"]["mean"],
+                    img_stats["right"]["std"],
                 ),
             }
 
@@ -285,11 +311,15 @@ class RunACT(Policy):
             dtype=np.float32,
         )
 
-        # Normalize State
+        # Append 12-D task one-hot (set in insert_cable() before loop entry).
+        # Total obs.state -> 24-D, matching the *_rot6d_slim training schema.
+        state_np = np.concatenate([state_np, self._task_one_hot])
+
+        # Normalize State using the active head's stats.
         raw_state_tensor = (
             torch.from_numpy(state_np).float().unsqueeze(0).to(self.device)
         )
-        obs["observation.state"] = (raw_state_tensor - self.state_mean) / self.state_std
+        obs["observation.state"] = (raw_state_tensor - self.active["state_mean"]) / self.active["state_std"]
 
         return obs
 
@@ -301,8 +331,35 @@ class RunACT(Policy):
         send_feedback: SendFeedbackCallback,
         **kwargs,
     ):
-        self.policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
+
+        # --- Head selection: NIC vs SC based on target_module_name ---
+        mod = task.target_module_name
+        if mod.startswith("nic_card_mount_"):
+            self.active = self.heads["nic"]; head_label = "NIC"
+        elif mod.startswith("sc_port_"):
+            self.active = self.heads["sc"];  head_label = "SC"
+        else:
+            self.get_logger().warning(
+                f"unknown target_module {mod!r}; defaulting to NIC head"
+            )
+            self.active = self.heads["nic"]; head_label = "NIC"
+        self.get_logger().info(f"selected {head_label} head for task {task.id}")
+        self.active["policy"].reset()
+
+        # Encode (target_module_name, port_name) -> 12-D one-hot. All-zero fallback
+        # if the pair isn't in TASK_ID_TABLE — policy will see no task signal, log
+        # a warning so eval-time misconfig is visible.
+        target_key = (task.target_module_name, task.port_name)
+        self._task_one_hot = np.zeros(TASK_ID_DIM, dtype=np.float32)
+        if target_key in TASK_ID_INDEX:
+            idx = TASK_ID_INDEX[target_key]
+            self._task_one_hot[idx] = 1.0
+            self.get_logger().info(f"task one-hot index {idx} for {target_key}")
+        else:
+            self.get_logger().warning(
+                f"target {target_key!r} not in TASK_ID_TABLE; sending all-zero one-hot"
+            )
 
         start_time = time.time()
 
@@ -318,13 +375,13 @@ class RunACT(Policy):
 
             obs_tensors = self.prepare_observations(observation_msg)
 
-            # 2. Model Inference
+            # 2. Model Inference (use the active head selected at task start)
             with torch.inference_mode():
                 # shape [1, 9]: [px, py, pz, rot6d.0..5]
-                normalized_action = self.policy.select_action(obs_tensors)
+                normalized_action = self.active["policy"].select_action(obs_tensors)
 
-            # 3. Un-normalize Action
-            raw_action_tensor = (normalized_action * self.action_std) + self.action_mean
+            # 3. Un-normalize Action using the active head's action stats.
+            raw_action_tensor = (normalized_action * self.active["action_std"]) + self.active["action_mean"]
             action = raw_action_tensor[0].cpu().numpy()
 
             # 4. Decode Cartesian pose: [px,py,pz, rot6d] -> (position, quaternion)
